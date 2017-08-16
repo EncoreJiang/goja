@@ -2,8 +2,8 @@ package goja
 
 import (
 	"fmt"
-	"github.com/dop251/goja/ast"
-	"github.com/dop251/goja/file"
+	"github.com/EncoreJiang/goja/ast"
+	"github.com/EncoreJiang/goja/file"
 	"sort"
 	"strconv"
 )

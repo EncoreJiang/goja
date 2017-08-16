@@ -3,7 +3,7 @@ goja
 
 ECMAScript 5.1(+) implementation in Go.
 
-[![GoDoc](https://godoc.org/github.com/dop251/goja?status.svg)](https://godoc.org/github.com/dop251/goja)
+[![GoDoc](https://godoc.org/github.com/EncoreJiang/goja?status.svg)](https://godoc.org/github.com/EncoreJiang/goja)
 
 It is not a replacement for V8 or SpiderMonkey or any other general-purpose JavaScript engine as it is much slower.
 It can be used as an embedded scripting language where the cost of making a lot of cgo calls may
@@ -156,4 +156,4 @@ func TestInterrupt(t *testing.T) {
 NodeJS Compatibility
 --------------------
 
-There is a [separate project](https://github.com/dop251/goja_nodejs) aimed at providing some of the NodeJS functionality.
+There is a [separate project](https://github.com/EncoreJiang/goja_nodejs) aimed at providing some of the NodeJS functionality.

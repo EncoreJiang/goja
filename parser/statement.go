@@ -1,9 +1,9 @@
 package parser
 
 import (
-	"github.com/dop251/goja/ast"
-	"github.com/dop251/goja/file"
-	"github.com/dop251/goja/token"
+	"github.com/EncoreJiang/goja/ast"
+	"github.com/EncoreJiang/goja/file"
+	"github.com/EncoreJiang/goja/token"
 )
 
 func (self *_parser) parseBlockStatement() *ast.BlockStatement {
