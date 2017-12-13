@@ -39,6 +39,9 @@ func (f *SrcFile) Position(offset int) Position {
 	}
 
 	if line >= 0 {
+		if line >= len(f.lineOffsets) {
+			line = len(f.lineOffsets) - 1
+		}
 		if f.lineOffsets[line] > offset {
 			line--
 		}

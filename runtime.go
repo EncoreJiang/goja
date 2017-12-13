@@ -1057,6 +1057,7 @@ func (r *Runtime) wrapReflectFunc(value reflect.Value) func(FunctionCall) Value 
 		}
 
 		var out []reflect.Value
+
 		if callSlice {
 			out = value.CallSlice(in)
 		} else {

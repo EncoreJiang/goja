@@ -12,6 +12,11 @@ type JsonEncodable interface {
 	JsonEncodable() interface{}
 }
 
+type Integer interface {
+	Integer() int64
+	ToString() string
+}
+
 // FieldNameMapper provides custom mapping between Go and JavaScript property names.
 type FieldNameMapper interface {
 	// FieldName returns a JavaScript name for the given struct field in the given type.
@@ -45,26 +50,44 @@ type objectGoReflect struct {
 
 func (o *objectGoReflect) init() {
 	o.baseObject.init()
-	switch o.value.Kind() {
-	case reflect.Bool:
-		o.class = classBoolean
-		o.prototype = o.val.runtime.global.BooleanPrototype
-	case reflect.String:
-		o.class = classString
-		o.prototype = o.val.runtime.global.StringPrototype
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
 
+	switch v := o.value.Interface().(type) {
+	case Integer:
+		fmt.Println(o.value.Interface()) // TODO remove
 		o.class = classNumber
 		o.prototype = o.val.runtime.global.NumberPrototype
-	default:
-		o.class = classObject
-		o.prototype = o.val.runtime.global.ObjectPrototype
-	}
+		o.baseObject._putProp("toString", o.val.runtime.newNativeFunc(o.val.runtime.wrapReflectFunc(reflect.ValueOf(v.ToString)), nil, "toString", nil, 0), true, false, true)
+		o.baseObject._putProp("valueOf", o.val.runtime.newNativeFunc(o.val.runtime.wrapReflectFunc(reflect.ValueOf(v.Integer)), nil, "valueOf", nil, 0), true, false, true)
 
-	o.baseObject._putProp("toString", o.val.runtime.newNativeFunc(o.toStringFunc, nil, "toString", nil, 0), true, false, true)
-	o.baseObject._putProp("valueOf", o.val.runtime.newNativeFunc(o.valueOfFunc, nil, "valueOf", nil, 0), true, false, true)
+	case fmt.Stringer:
+		o.class = classString
+		o.prototype = o.val.runtime.global.StringPrototype
+		o.baseObject._putProp("toString", o.val.runtime.newNativeFunc(o.val.runtime.wrapReflectFunc(reflect.ValueOf(v.String)), nil, "toString", nil, 0), true, false, true)
+		o.baseObject._putProp("valueOf", o.val.runtime.newNativeFunc(o.val.runtime.wrapReflectFunc(reflect.ValueOf(v.String)), nil, "valueOf", nil, 0), true, false, true)
+
+	default:
+		switch o.value.Kind() {
+		case reflect.Bool:
+			o.class = classBoolean
+			o.prototype = o.val.runtime.global.BooleanPrototype
+		case reflect.String:
+			o.class = classString
+			o.prototype = o.val.runtime.global.StringPrototype
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+
+			o.class = classNumber
+			o.prototype = o.val.runtime.global.NumberPrototype
+		default:
+			o.class = classObject
+			o.prototype = o.val.runtime.global.ObjectPrototype
+		}
+
+		o.baseObject._putProp("toString", o.val.runtime.newNativeFunc(o.toStringFunc, nil, "toString", nil, 0), true, false, true)
+		o.baseObject._putProp("valueOf", o.val.runtime.newNativeFunc(o.valueOfFunc, nil, "valueOf", nil, 0), true, false, true)
+
+	}
 
 	o.valueTypeInfo = o.val.runtime.typeInfo(o.value.Type())
 	o.origValueTypeInfo = o.val.runtime.typeInfo(o.origValue.Type())
@@ -290,6 +313,12 @@ func (o *objectGoReflect) _toNumber() Value {
 	case reflect.Float32, reflect.Float64:
 		return floatToValue(o.value.Float())
 	}
+
+	switch v := o.value.Interface().(type) {
+	case Integer:
+		return intToValue(v.Integer())
+	}
+
 	return nil
 }
 
@@ -304,10 +333,12 @@ func (o *objectGoReflect) _toString() Value {
 			return stringFalse
 		}
 	}
+
 	switch v := o.value.Interface().(type) {
 	case fmt.Stringer:
 		return newStringValue(v.String())
 	}
+
 	return stringObjectObject
 }
 
@@ -326,6 +357,7 @@ func (o *objectGoReflect) toPrimitiveString() Value {
 }
 
 func (o *objectGoReflect) toPrimitive() Value {
+	fmt.Println(o.value.Interface(), o)
 	if o.prototype == o.val.runtime.global.NumberPrototype {
 		return o.toPrimitiveNumber()
 	}
