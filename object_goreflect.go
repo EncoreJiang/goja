@@ -53,7 +53,6 @@ func (o *objectGoReflect) init() {
 
 	switch v := o.value.Interface().(type) {
 	case Integer:
-		fmt.Println(o.value.Interface()) // TODO remove
 		o.class = classNumber
 		o.prototype = o.val.runtime.global.NumberPrototype
 		o.baseObject._putProp("toString", o.val.runtime.newNativeFunc(o.val.runtime.wrapReflectFunc(reflect.ValueOf(v.ToString)), nil, "toString", nil, 0), true, false, true)
@@ -357,7 +356,6 @@ func (o *objectGoReflect) toPrimitiveString() Value {
 }
 
 func (o *objectGoReflect) toPrimitive() Value {
-	fmt.Println(o.value.Interface(), o)
 	if o.prototype == o.val.runtime.global.NumberPrototype {
 		return o.toPrimitiveNumber()
 	}

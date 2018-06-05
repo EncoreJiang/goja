@@ -128,8 +128,9 @@ func (f *stackFrame) write(b *bytes.Buffer) {
 }
 
 type Exception struct {
-	val   Value
-	stack []stackFrame
+	SourceMap func()
+	val       Value
+	stack     []stackFrame
 }
 
 type InterruptedError struct {

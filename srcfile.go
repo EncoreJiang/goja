@@ -16,6 +16,8 @@ type SrcFile struct {
 
 	lineOffsets       []int
 	lastScannedOffset int
+
+	sourceMapFn func(row, line int) (int, int)
 }
 
 func NewSrcFile(name, src string) *SrcFile {
@@ -51,10 +53,16 @@ func (f *SrcFile) Position(offset int) Position {
 	if line >= 0 {
 		lineStart = f.lineOffsets[line]
 	}
-	return Position{
+
+	pos := Position{
 		Line: line + 2,
 		Col:  offset - lineStart + 1,
 	}
+
+	if f.sourceMapFn != nil {
+		pos.Line, pos.Col = f.sourceMapFn(pos.Line, pos.Col)
+	}
+	return pos
 }
 
 func (f *SrcFile) scanTo(offset int) {

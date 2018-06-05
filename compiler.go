@@ -2,10 +2,11 @@ package goja
 
 import (
 	"fmt"
-	"github.com/EncoreJiang/goja/ast"
-	"github.com/EncoreJiang/goja/file"
 	"sort"
 	"strconv"
+
+	"github.com/EncoreJiang/goja/ast"
+	"github.com/EncoreJiang/goja/file"
 )
 
 const (
@@ -42,6 +43,10 @@ type Program struct {
 	funcName string
 	src      *SrcFile
 	srcMap   []srcMapItem
+}
+
+func (p *Program) SetSourceMapFun(fn func(row, line int) (int, int)) {
+	p.src.sourceMapFn = fn
 }
 
 type compiler struct {
