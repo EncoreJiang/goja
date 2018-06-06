@@ -45,10 +45,6 @@ type Program struct {
 	srcMap   []srcMapItem
 }
 
-func (p *Program) SetSourceMapFun(fn func(row, line int) (int, int)) {
-	p.src.sourceMapFn = fn
-}
-
 type compiler struct {
 	p          *Program
 	scope      *scope
