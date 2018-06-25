@@ -1302,7 +1302,14 @@ func (r *Runtime) toReflectValue(v Value, typ reflect.Type) (reflect.Value, erro
 			for i := 0; i < typ.NumField(); i++ {
 				field := typ.Field(i)
 				if ast.IsExported(field.Name) {
-					v := o.self.getStr(field.Name)
+					name := field.Name
+					if r.fieldNameMapper != nil {
+						nname := r.fieldNameMapper.FieldName(typ, field)
+						if nname != "" {
+							name = nname
+						}
+					}
+					v := o.self.getStr(name)
 					if v != nil {
 						vv, err := r.toReflectValue(v, field.Type)
 						if err != nil {
