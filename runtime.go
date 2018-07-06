@@ -1304,10 +1304,7 @@ func (r *Runtime) toReflectValue(v Value, typ reflect.Type) (reflect.Value, erro
 				if ast.IsExported(field.Name) {
 					name := field.Name
 					if r.fieldNameMapper != nil {
-						nname := r.fieldNameMapper.FieldName(typ, field)
-						if nname != "" {
-							name = nname
-						}
+						name = r.fieldNameMapper.FieldName(typ, field)
 					}
 					v := o.self.getStr(name)
 					if v != nil {
@@ -1322,6 +1319,14 @@ func (r *Runtime) toReflectValue(v Value, typ reflect.Type) (reflect.Value, erro
 			}
 			return s, nil
 		}
+	case reflect.Ptr:
+		ptr := reflect.New(typ.Elem())
+		elem, err := r.toReflectValue(v, typ.Elem())
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		ptr.Elem().Set(elem)
+		return ptr, nil
 	case reflect.Func:
 		if fn, ok := AssertFunction(v); ok {
 			return reflect.MakeFunc(typ, r.wrapJSFunc(fn, typ)), nil
