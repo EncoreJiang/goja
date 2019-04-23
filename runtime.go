@@ -2,2534 +2,1483 @@ package goja
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"log"
+	"go/ast"
 	"math"
+	"math/rand"
+	"reflect"
 	"strconv"
-	"sync"
-	"sync/atomic"
+
+	js_ast "github.com/EncoreJiang/goja/ast"
+	"github.com/EncoreJiang/goja/parser"
 )
 
 const (
-	maxInt = 1 << 53
+	sqrt1_2 float64 = math.Sqrt2 / 2
 )
 
-type valueStack []Value
+var (
+	typeCallable = reflect.TypeOf(Callable(nil))
+	typeValue    = reflect.TypeOf((*Value)(nil)).Elem()
+)
 
-type stash struct {
-	values    valueStack
-	extraArgs valueStack
-	names     map[string]uint32
-	obj       objectImpl
+type global struct {
+	Object   *Object
+	Array    *Object
+	Function *Object
+	String   *Object
+	Number   *Object
+	Boolean  *Object
+	RegExp   *Object
+	Date     *Object
 
-	outer *stash
+	ArrayBuffer *Object
+
+	Error          *Object
+	TypeError      *Object
+	ReferenceError *Object
+	SyntaxError    *Object
+	RangeError     *Object
+	EvalError      *Object
+	URIError       *Object
+
+	GoError *Object
+
+	ObjectPrototype   *Object
+	ArrayPrototype    *Object
+	NumberPrototype   *Object
+	StringPrototype   *Object
+	BooleanPrototype  *Object
+	FunctionPrototype *Object
+	RegExpPrototype   *Object
+	DatePrototype     *Object
+
+	ArrayBufferPrototype *Object
+
+	ErrorPrototype          *Object
+	TypeErrorPrototype      *Object
+	SyntaxErrorPrototype    *Object
+	RangeErrorPrototype     *Object
+	ReferenceErrorPrototype *Object
+	EvalErrorPrototype      *Object
+	URIErrorPrototype       *Object
+
+	GoErrorPrototype *Object
+
+	Eval *Object
+
+	thrower         *Object
+	throwerProperty Value
 }
 
-type context struct {
+type Flag int
+
+const (
+	FLAG_NOT_SET Flag = iota
+	FLAG_FALSE
+	FLAG_TRUE
+)
+
+func (f Flag) Bool() bool {
+	return f == FLAG_TRUE
+}
+
+func ToFlag(b bool) Flag {
+	if b {
+		return FLAG_TRUE
+	}
+	return FLAG_FALSE
+}
+
+type RandSource func() float64
+
+type Runtime struct {
+	global          global
+	globalObject    *Object
+	stringSingleton *stringObject
+	rand            RandSource
+
+	typeInfoCache   map[reflect.Type]*reflectTypeInfo
+	fieldNameMapper FieldNameMapper
+
+	vm *vm
+}
+
+type stackFrame struct {
 	prg      *Program
 	funcName string
-	stash    *stash
-	pc, sb   int
-	args     int
+	pc       int
 }
 
-type iterStackItem struct {
-	val Value
-	f   iterNextFunc
+func (f *stackFrame) position() Position {
+	return f.prg.src.Position(f.prg.sourceOffset(f.pc))
 }
 
-type ref interface {
-	get() Value
-	set(Value)
-	refname() string
-}
-
-type stashRef struct {
-	v *Value
-	n string
-}
-
-func (r stashRef) get() Value {
-	return *r.v
-}
-
-func (r *stashRef) set(v Value) {
-	*r.v = v
-}
-
-func (r *stashRef) refname() string {
-	return r.n
-}
-
-type objRef struct {
-	base   objectImpl
-	name   string
-	strict bool
-}
-
-func (r *objRef) get() Value {
-	return r.base.getStr(r.name)
-}
-
-func (r *objRef) set(v Value) {
-	r.base.putStr(r.name, v, r.strict)
-}
-
-func (r *objRef) refname() string {
-	return r.name
-}
-
-type unresolvedRef struct {
-	runtime *Runtime
-	name    string
-}
-
-func (r *unresolvedRef) get() Value {
-	r.runtime.throwReferenceError(r.name)
-	panic("Unreachable")
-}
-
-func (r *unresolvedRef) set(v Value) {
-	r.get()
-}
-
-func (r *unresolvedRef) refname() string {
-	return r.name
-}
-
-type vm struct {
-	r            *Runtime
-	prg          *Program
-	funcName     string
-	pc           int
-	stack        valueStack
-	sp, sb, args int
-
-	stash     *stash
-	callStack []context
-	iterStack []iterStackItem
-	refStack  []ref
-
-	stashAllocs int
-	halt        bool
-
-	interrupted   uint32
-	interruptVal  interface{}
-	interruptLock sync.Mutex
-}
-
-type instruction interface {
-	exec(*vm)
-}
-
-func intToValue(i int64) Value {
-	if i >= -maxInt && i <= maxInt {
-		if i >= -128 && i <= 127 {
-			return intCache[i+128]
+func (f *stackFrame) write(b *bytes.Buffer) {
+	if f.prg != nil {
+		if n := f.prg.funcName; n != "" {
+			b.WriteString(n)
+			b.WriteString(" (")
 		}
-		return valueInt(i)
-	}
-	return valueFloat(float64(i))
-}
-
-func floatToInt(f float64) (result int64, ok bool) {
-	if (f != 0 || !math.Signbit(f)) && !math.IsInf(f, 0) && f == math.Trunc(f) && f >= -maxInt && f <= maxInt {
-		return int64(f), true
-	}
-	return 0, false
-}
-
-func floatToValue(f float64) (result Value) {
-	if i, ok := floatToInt(f); ok {
-		return intToValue(i)
-	}
-	switch {
-	case f == 0:
-		return _negativeZero
-	case math.IsNaN(f):
-		return _NaN
-	case math.IsInf(f, 1):
-		return _positiveInf
-	case math.IsInf(f, -1):
-		return _negativeInf
-	}
-	return valueFloat(f)
-}
-
-func toInt(v Value) (int64, bool) {
-	num := v.ToNumber()
-	if i, ok := num.assertInt(); ok {
-		return i, true
-	}
-	if f, ok := num.assertFloat(); ok {
-		if i, ok := floatToInt(f); ok {
-			return i, true
+		if n := f.prg.src.name; n != "" {
+			b.WriteString(n)
+		} else {
+			b.WriteString("<eval>")
 		}
-	}
-	return 0, false
-}
-
-func toIntIgnoreNegZero(v Value) (int64, bool) {
-	num := v.ToNumber()
-	if i, ok := num.assertInt(); ok {
-		return i, true
-	}
-	if f, ok := num.assertFloat(); ok {
-		if v == _negativeZero {
-			return 0, true
+		b.WriteByte(':')
+		b.WriteString(f.position().String())
+		b.WriteByte('(')
+		b.WriteString(strconv.Itoa(f.pc))
+		b.WriteByte(')')
+		if f.prg.funcName != "" {
+			b.WriteByte(')')
 		}
-		if i, ok := floatToInt(f); ok {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-func (s *valueStack) expand(idx int) {
-	if idx < len(*s) {
-		return
-	}
-
-	if idx < cap(*s) {
-		*s = (*s)[:idx+1]
 	} else {
-		n := make([]Value, idx+1, (idx+1)<<1)
-		copy(n, *s)
-		*s = n
-	}
-}
-
-func (s *stash) put(name string, v Value) bool {
-	if s.obj != nil {
-		if found := s.obj.getStr(name); found != nil {
-			s.obj.putStr(name, v, false)
-			return true
+		if f.funcName != "" {
+			b.WriteString(f.funcName)
+			b.WriteString(" (")
 		}
-		return false
-	} else {
-		if idx, found := s.names[name]; found {
-			s.values.expand(int(idx))
-			s.values[idx] = v
-			return true
-		}
-		return false
-	}
-}
-
-func (s *stash) putByIdx(idx uint32, v Value) {
-	if s.obj != nil {
-		panic("Attempt to put by idx into an object scope")
-	}
-	s.values.expand(int(idx))
-	s.values[idx] = v
-}
-
-func (s *stash) getByIdx(idx uint32) Value {
-	if int(idx) < len(s.values) {
-		return s.values[idx]
-	}
-	return _undefined
-}
-
-func (s *stash) getByName(name string, vm *vm) (v Value, exists bool) {
-	if s.obj != nil {
-		v = s.obj.getStr(name)
-		if v == nil {
-			return nil, false
-			//return valueUnresolved{r: vm.r, ref: name}, false
-		}
-		return v, true
-	}
-	if idx, exists := s.names[name]; exists {
-		return s.values[idx], true
-	}
-	return nil, false
-	//return valueUnresolved{r: vm.r, ref: name}, false
-}
-
-func (s *stash) createBinding(name string) {
-	if s.names == nil {
-		s.names = make(map[string]uint32)
-	}
-	if _, exists := s.names[name]; !exists {
-		s.names[name] = uint32(len(s.names))
-		s.values = append(s.values, _undefined)
-	}
-}
-
-func (s *stash) deleteBinding(name string) bool {
-	if s.obj != nil {
-		return s.obj.deleteStr(name, false)
-	}
-	if idx, found := s.names[name]; found {
-		s.values[idx] = nil
-		delete(s.names, name)
-		return true
-	}
-	return false
-}
-
-func (vm *vm) newStash() {
-	vm.stash = &stash{
-		outer: vm.stash,
-	}
-	vm.stashAllocs++
-}
-
-func (vm *vm) init() {
-}
-
-func (vm *vm) run() {
-	vm.halt = false
-	interrupted := false
-	for !vm.halt {
-		if interrupted = atomic.LoadUint32(&vm.interrupted) != 0; interrupted {
-			break
-		}
-		vm.prg.code[vm.pc].exec(vm)
-	}
-
-	if interrupted {
-		vm.interruptLock.Lock()
-		v := &InterruptedError{
-			iface: vm.interruptVal,
-		}
-		atomic.StoreUint32(&vm.interrupted, 0)
-		vm.interruptVal = nil
-		vm.interruptLock.Unlock()
-		panic(v)
-	}
-}
-
-func (vm *vm) Interrupt(v interface{}) {
-	vm.interruptLock.Lock()
-	vm.interruptVal = v
-	atomic.StoreUint32(&vm.interrupted, 1)
-	vm.interruptLock.Unlock()
-}
-
-func (vm *vm) captureStack(stack []stackFrame, ctxOffset int) []stackFrame {
-	// Unroll the context stack
-	stack = append(stack, stackFrame{prg: vm.prg, pc: vm.pc, funcName: vm.funcName})
-	for i := len(vm.callStack) - 1; i > ctxOffset-1; i-- {
-		if vm.callStack[i].pc != -1 {
-			stack = append(stack, stackFrame{prg: vm.callStack[i].prg, pc: vm.callStack[i].pc - 1, funcName: vm.callStack[i].funcName})
+		b.WriteString("native")
+		if f.funcName != "" {
+			b.WriteByte(')')
 		}
 	}
-	return stack
 }
 
-func (vm *vm) try(f func()) (ex *Exception) {
-	var ctx context
-	vm.saveCtx(&ctx)
+type Exception struct {
+	SourceMap func()
+	val       Value
+	stack     []stackFrame
+}
 
-	ctxOffset := len(vm.callStack)
-	sp := vm.sp
-	iterLen := len(vm.iterStack)
-	refLen := len(vm.refStack)
+type InterruptedError struct {
+	Exception
+	iface interface{}
+}
 
-	defer func() {
-		if x := recover(); x != nil {
-			defer func() {
-				vm.callStack = vm.callStack[:ctxOffset]
-				vm.restoreCtx(&ctx)
-				vm.sp = sp
+func (e *InterruptedError) Value() interface{} {
+	return e.iface
+}
 
-				// Restore other stacks
-				iterTail := vm.iterStack[iterLen:]
-				for i, _ := range iterTail {
-					iterTail[i] = iterStackItem{}
-				}
-				vm.iterStack = vm.iterStack[:iterLen]
-				refTail := vm.refStack[refLen:]
-				for i, _ := range refTail {
-					refTail[i] = nil
-				}
-				vm.refStack = vm.refStack[:refLen]
-			}()
+func (e *InterruptedError) String() string {
+	if e == nil {
+		return "<nil>"
+	}
+	var b bytes.Buffer
+	if e.iface != nil {
+		b.WriteString(fmt.Sprint(e.iface))
+		b.WriteByte('\n')
+	}
+	e.writeFullStack(&b)
+	return b.String()
+}
 
-			b := bytes.NewBuffer(nil)
-			stack := vm.captureStack(nil, 0)
-			for _, s := range stack {
-				s.write(b)
-				fmt.Fprintln(b)
-			}
+func (e *InterruptedError) Error() string {
+	if e == nil || e.iface == nil {
+		return "<nil>"
+	}
+	var b bytes.Buffer
+	b.WriteString(fmt.Sprint(e.iface))
+	e.writeShortStack(&b)
+	return b.String()
+}
 
-			switch x1 := x.(type) {
-			case *Object:
-				ex = &Exception{
-					val: x1,
-				}
-				x1.Set("stack", b.String())
-			case Value:
-				ex = &Exception{
-					val: x1,
-				}
-			case error:
-				e := vm.r.NewGoError(x1)
-				e.Set("stack", b.String())
+func (e *Exception) writeFullStack(b *bytes.Buffer) {
+	for _, frame := range e.stack {
+		b.WriteString("\tat ")
+		frame.write(b)
+		b.WriteByte('\n')
+	}
+}
 
-				ex = &Exception{
-					val: e,
-				}
-			case *InterruptedError:
-				x1.stack = vm.captureStack(x1.stack, 0)
-				panic(x1)
-			case *Exception:
-				ex = x1
-			default:
-				if vm.prg != nil {
-					vm.prg.dumpCode(log.Printf)
-				}
-				//log.Print("Stack: ", string(debug.Stack()))
-				panic(fmt.Errorf("Panic at %d: %v", vm.pc, x))
-			}
-			ex.stack = stack
-		}
-	}()
+func (e *Exception) writeShortStack(b *bytes.Buffer) {
+	if len(e.stack) > 0 && (e.stack[0].prg != nil || e.stack[0].funcName != "") {
+		b.WriteString(" at ")
+		e.stack[0].write(b)
+	}
+}
 
-	f()
+func (e *Exception) String() string {
+	if e == nil {
+		return "<nil>"
+	}
+	var b bytes.Buffer
+	if e.val != nil {
+		b.WriteString(e.val.String())
+		b.WriteByte('\n')
+	}
+	e.writeFullStack(&b)
+	return b.String()
+}
+
+func (e *Exception) Error() string {
+	if e == nil || e.val == nil {
+		return "<nil>"
+	}
+	var b bytes.Buffer
+	b.WriteString(e.val.String())
+	e.writeShortStack(&b)
+	return b.String()
+}
+
+func (e *Exception) Value() Value {
+	return e.val
+}
+
+func (r *Runtime) addToGlobal(name string, value Value) {
+	r.globalObject.self._putProp(name, value, true, false, true)
+}
+
+func (r *Runtime) init() {
+	r.rand = rand.Float64
+	r.global.ObjectPrototype = r.newBaseObject(nil, classObject).val
+	r.globalObject = r.NewObject()
+
+	r.vm = &vm{
+		r: r,
+	}
+	r.vm.init()
+
+	r.global.FunctionPrototype = r.newNativeFunc(nil, nil, "Empty", nil, 0)
+	r.initObject()
+	r.initFunction()
+	r.initArray()
+	r.initString()
+	r.initNumber()
+	r.initRegExp()
+	r.initDate()
+	r.initBoolean()
+
+	r.initErrors()
+
+	r.global.Eval = r.newNativeFunc(r.builtin_eval, nil, "eval", nil, 1)
+	r.addToGlobal("eval", r.global.Eval)
+
+	r.initGlobalObject()
+
+	r.initMath()
+	r.initJSON()
+
+	//r.initTypedArrays()
+
+	r.global.thrower = r.newNativeFunc(r.builtin_thrower, nil, "thrower", nil, 0)
+	r.global.throwerProperty = &valueProperty{
+		getterFunc: r.global.thrower,
+		setterFunc: r.global.thrower,
+		accessor:   true,
+	}
+}
+
+func (r *Runtime) typeErrorResult(throw bool, args ...interface{}) {
+	if throw {
+		panic(r.NewTypeError(args...))
+	}
+}
+
+func (r *Runtime) newError(typ *Object, format string, args ...interface{}) Value {
+	msg := fmt.Sprintf(format, args...)
+	return r.builtin_new(typ, []Value{newStringValue(msg)})
+}
+
+func (r *Runtime) throwReferenceError(name string) {
+	panic(r.newError(r.global.ReferenceError, "%s is not defined", name))
+}
+
+func (r *Runtime) newSyntaxError(msg string, offset int) Value {
+	return r.builtin_new((r.global.SyntaxError), []Value{newStringValue(msg)})
+}
+
+func (r *Runtime) newArray(prototype *Object) (a *arrayObject) {
+	v := &Object{runtime: r}
+
+	a = &arrayObject{}
+	a.class = classArray
+	a.val = v
+	a.extensible = true
+	v.self = a
+	a.prototype = prototype
+	a.init()
 	return
 }
 
-func (vm *vm) runTry() (ex *Exception) {
-	return vm.try(vm.run)
+func (r *Runtime) newArrayObject() *arrayObject {
+	return r.newArray(r.global.ArrayPrototype)
 }
 
-func (vm *vm) push(v Value) {
-	vm.stack.expand(vm.sp)
-	vm.stack[vm.sp] = v
-	vm.sp++
+func (r *Runtime) newArrayValues(values []Value) *Object {
+	v := &Object{runtime: r}
+
+	a := &arrayObject{}
+	a.class = classArray
+	a.val = v
+	a.extensible = true
+	v.self = a
+	a.prototype = r.global.ArrayPrototype
+	a.init()
+	a.values = values
+	a.length = int64(len(values))
+	a.objCount = a.length
+	return v
 }
 
-func (vm *vm) pop() Value {
-	vm.sp--
-	return vm.stack[vm.sp]
+func (r *Runtime) newArrayLength(l int64) *Object {
+	a := r.newArrayValues(nil)
+	a.self.putStr("length", intToValue(l), true)
+	return a
 }
 
-func (vm *vm) peek() Value {
-	return vm.stack[vm.sp-1]
+func (r *Runtime) newBaseObject(proto *Object, class string) (o *baseObject) {
+	v := &Object{runtime: r}
+
+	o = &baseObject{}
+	o.class = class
+	o.val = v
+	o.extensible = true
+	v.self = o
+	o.prototype = proto
+	o.init()
+	return
 }
 
-func (vm *vm) saveCtx(ctx *context) {
-	ctx.prg = vm.prg
-	ctx.funcName = vm.funcName
-	ctx.stash = vm.stash
-	ctx.pc = vm.pc
-	ctx.sb = vm.sb
-	ctx.args = vm.args
+func (r *Runtime) NewObject() (v *Object) {
+	return r.newBaseObject(r.global.ObjectPrototype, classObject).val
 }
 
-func (vm *vm) pushCtx() {
-	/*
-		vm.ctxStack = append(vm.ctxStack, context{
-			prg: vm.prg,
-			stash: vm.stash,
-			pc: vm.pc,
-			sb: vm.sb,
-			args: vm.args,
-		})*/
-	vm.callStack = append(vm.callStack, context{})
-	vm.saveCtx(&vm.callStack[len(vm.callStack)-1])
+// CreateObject creates an object with given prototype. Equivalent of Object.create(proto).
+func (r *Runtime) CreateObject(proto *Object) *Object {
+	return r.newBaseObject(proto, classObject).val
 }
 
-func (vm *vm) restoreCtx(ctx *context) {
-	vm.prg = ctx.prg
-	vm.funcName = ctx.funcName
-	vm.pc = ctx.pc
-	vm.stash = ctx.stash
-	vm.sb = ctx.sb
-	vm.args = ctx.args
-}
-
-func (vm *vm) popCtx() {
-	l := len(vm.callStack) - 1
-	vm.prg = vm.callStack[l].prg
-	vm.callStack[l].prg = nil
-	vm.funcName = vm.callStack[l].funcName
-	vm.pc = vm.callStack[l].pc
-	vm.stash = vm.callStack[l].stash
-	vm.callStack[l].stash = nil
-	vm.sb = vm.callStack[l].sb
-	vm.args = vm.callStack[l].args
-
-	vm.callStack = vm.callStack[:l]
-}
-
-func (r *Runtime) toObject(v Value, args ...interface{}) *Object {
-	//r.checkResolveable(v)
-	if obj, ok := v.(*Object); ok {
-		return obj
-	}
+func (r *Runtime) NewTypeError(args ...interface{}) *Object {
+	msg := ""
 	if len(args) > 0 {
-		r.typeErrorResult(true, args)
-	} else {
-		r.typeErrorResult(true, "Value is not an object: %s", v.ToString())
+		f, _ := args[0].(string)
+		msg = fmt.Sprintf(f, args[1:]...)
 	}
-	panic("Unreachable")
+	return r.builtin_new(r.global.TypeError, []Value{newStringValue(msg)})
 }
 
-func (r *Runtime) toCallee(v Value) *Object {
-	if obj, ok := v.(*Object); ok {
-		return obj
-	}
-	switch unresolved := v.(type) {
-	case valueUnresolved:
-		unresolved.throw()
-		panic("Unreachable")
-	case memberUnresolved:
-		r.typeErrorResult(true, "Object has no member '%s'", unresolved.ref)
-		panic("Unreachable")
-	}
-	r.typeErrorResult(true, "Value is not an object: %s", v.ToString())
-	panic("Unreachable")
-}
-
-type _newStash struct{}
-
-var newStash _newStash
-
-func (_newStash) exec(vm *vm) {
-	vm.newStash()
-	vm.pc++
-}
-
-type _noop struct{}
-
-var noop _noop
-
-func (_noop) exec(vm *vm) {
-	vm.pc++
-}
-
-type loadVal uint32
-
-func (l loadVal) exec(vm *vm) {
-	vm.push(vm.prg.values[l])
-	vm.pc++
-}
-
-type loadVal1 uint32
-
-func (l *loadVal1) exec(vm *vm) {
-	vm.push(vm.prg.values[*l])
-	vm.pc++
-}
-
-type _loadUndef struct{}
-
-var loadUndef _loadUndef
-
-func (_loadUndef) exec(vm *vm) {
-	vm.push(_undefined)
-	vm.pc++
-}
-
-type _loadNil struct{}
-
-var loadNil _loadNil
-
-func (_loadNil) exec(vm *vm) {
-	vm.push(nil)
-	vm.pc++
-}
-
-type _loadGlobalObject struct{}
-
-var loadGlobalObject _loadGlobalObject
-
-func (_loadGlobalObject) exec(vm *vm) {
-	vm.push(vm.r.globalObject)
-	vm.pc++
-}
-
-type loadStack int
-
-func (l loadStack) exec(vm *vm) {
-	// l < 0 -- arg<-l-1>
-	// l > 0 -- var<l-1>
-	// l == 0 -- this
-
-	if l < 0 {
-		arg := int(-l)
-		if arg > vm.args {
-			vm.push(_undefined)
-		} else {
-			vm.push(vm.stack[vm.sb+arg])
-		}
-	} else if l > 0 {
-		vm.push(vm.stack[vm.sb+vm.args+int(l)])
-	} else {
-		vm.push(vm.stack[vm.sb])
-	}
-	vm.pc++
-}
-
-type _loadCallee struct{}
-
-var loadCallee _loadCallee
-
-func (_loadCallee) exec(vm *vm) {
-	vm.push(vm.stack[vm.sb-1])
-	vm.pc++
-}
-
-func (vm *vm) storeStack(s int) {
-	// l < 0 -- arg<-l-1>
-	// l > 0 -- var<l-1>
-	// l == 0 -- this
-
-	if s < 0 {
-		vm.stack[vm.sb-s] = vm.stack[vm.sp-1]
-	} else if s > 0 {
-		vm.stack[vm.sb+vm.args+s] = vm.stack[vm.sp-1]
-	} else {
-		panic("Attempt to modify this")
-	}
-	vm.pc++
-}
-
-type storeStack int
-
-func (s storeStack) exec(vm *vm) {
-	vm.storeStack(int(s))
-}
-
-type storeStackP int
-
-func (s storeStackP) exec(vm *vm) {
-	vm.storeStack(int(s))
-	vm.sp--
-}
-
-type _toNumber struct{}
-
-var toNumber _toNumber
-
-func (_toNumber) exec(vm *vm) {
-	vm.stack[vm.sp-1] = vm.stack[vm.sp-1].ToNumber()
-	vm.pc++
-}
-
-type _add struct{}
-
-var add _add
-
-func (_add) exec(vm *vm) {
-	right := vm.stack[vm.sp-1]
-	left := vm.stack[vm.sp-2]
-
-	if o, ok := left.(*Object); ok {
-		left = o.self.toPrimitive()
-	}
-
-	if o, ok := right.(*Object); ok {
-		right = o.self.toPrimitive()
-	}
-
-	var ret Value
-
-	leftString, isLeftString := left.assertString()
-	rightString, isRightString := right.assertString()
-
-	if isLeftString || isRightString {
-		if !isLeftString {
-			leftString = left.ToString()
-		}
-		if !isRightString {
-			rightString = right.ToString()
-		}
-		ret = leftString.concat(rightString)
-	} else {
-		if leftInt, ok := left.assertInt(); ok {
-			if rightInt, ok := right.assertInt(); ok {
-				ret = intToValue(int64(leftInt) + int64(rightInt))
-			} else {
-				ret = floatToValue(float64(leftInt) + right.ToFloat())
-			}
-		} else {
-			ret = floatToValue(left.ToFloat() + right.ToFloat())
-		}
-	}
-
-	vm.stack[vm.sp-2] = ret
-	vm.sp--
-	vm.pc++
-}
-
-type _sub struct{}
-
-var sub _sub
-
-func (_sub) exec(vm *vm) {
-	right := vm.stack[vm.sp-1]
-	left := vm.stack[vm.sp-2]
-
-	var result Value
-
-	if left, ok := left.assertInt(); ok {
-		if right, ok := right.assertInt(); ok {
-			result = intToValue(left - right)
-			goto end
-		}
-	}
-
-	result = floatToValue(left.ToFloat() - right.ToFloat())
-end:
-	vm.sp--
-	vm.stack[vm.sp-1] = result
-	vm.pc++
-}
-
-type _mul struct{}
-
-var mul _mul
-
-func (_mul) exec(vm *vm) {
-	left := vm.stack[vm.sp-2]
-	right := vm.stack[vm.sp-1]
-
-	var result Value
-
-	if left, ok := toInt(left); ok {
-		if right, ok := toInt(right); ok {
-			if left == 0 && right == -1 || left == -1 && right == 0 {
-				result = _negativeZero
-				goto end
-			}
-			res := left * right
-			// check for overflow
-			if left == 0 || right == 0 || res/left == right {
-				result = intToValue(res)
-				goto end
-			}
-
-		}
-	}
-
-	result = floatToValue(left.ToFloat() * right.ToFloat())
-
-end:
-	vm.sp--
-	vm.stack[vm.sp-1] = result
-	vm.pc++
-}
-
-type _div struct{}
-
-var div _div
-
-func (_div) exec(vm *vm) {
-	left := vm.stack[vm.sp-2].ToFloat()
-	right := vm.stack[vm.sp-1].ToFloat()
-
-	var result Value
-
-	if math.IsNaN(left) || math.IsNaN(right) {
-		result = _NaN
-		goto end
-	}
-	if math.IsInf(left, 0) && math.IsInf(right, 0) {
-		result = _NaN
-		goto end
-	}
-	if left == 0 && right == 0 {
-		result = _NaN
-		goto end
-	}
-
-	if math.IsInf(left, 0) {
-		if math.Signbit(left) == math.Signbit(right) {
-			result = _positiveInf
-			goto end
-		} else {
-			result = _negativeInf
-			goto end
-		}
-	}
-	if math.IsInf(right, 0) {
-		if math.Signbit(left) == math.Signbit(right) {
-			result = _positiveZero
-			goto end
-		} else {
-			result = _negativeZero
-			goto end
-		}
-	}
-	if right == 0 {
-		if math.Signbit(left) == math.Signbit(right) {
-			result = _positiveInf
-			goto end
-		} else {
-			result = _negativeInf
-			goto end
-		}
-	}
-
-	result = floatToValue(left / right)
-
-end:
-	vm.sp--
-	vm.stack[vm.sp-1] = result
-	vm.pc++
-}
-
-type _mod struct{}
-
-var mod _mod
-
-func (_mod) exec(vm *vm) {
-	left := vm.stack[vm.sp-2]
-	right := vm.stack[vm.sp-1]
-
-	var result Value
-
-	if leftInt, ok := toInt(left); ok {
-		if rightInt, ok := toInt(right); ok {
-			if rightInt == 0 {
-				result = _NaN
-				goto end
-			}
-			r := leftInt % rightInt
-			if r == 0 && leftInt < 0 {
-				result = _negativeZero
-			} else {
-				result = intToValue(leftInt % rightInt)
-			}
-			goto end
-		}
-	}
-
-	result = floatToValue(math.Mod(left.ToFloat(), right.ToFloat()))
-end:
-	vm.sp--
-	vm.stack[vm.sp-1] = result
-	vm.pc++
-}
-
-type _neg struct{}
-
-var neg _neg
-
-func (_neg) exec(vm *vm) {
-	operand := vm.stack[vm.sp-1]
-
-	var result Value
-
-	if i, ok := toInt(operand); ok {
-		if i == 0 {
-			result = _negativeZero
-		} else {
-			result = valueInt(-i)
-		}
-	} else {
-		f := operand.ToFloat()
-		if !math.IsNaN(f) {
-			f = -f
-		}
-		result = valueFloat(f)
-	}
-
-	vm.stack[vm.sp-1] = result
-	vm.pc++
-}
-
-type _plus struct{}
-
-var plus _plus
-
-func (_plus) exec(vm *vm) {
-	vm.stack[vm.sp-1] = vm.stack[vm.sp-1].ToNumber()
-	vm.pc++
-}
-
-type _inc struct{}
-
-var inc _inc
-
-func (_inc) exec(vm *vm) {
-	v := vm.stack[vm.sp-1]
-
-	if i, ok := toInt(v); ok {
-		v = intToValue(i + 1)
-		goto end
-	}
-
-	v = valueFloat(v.ToFloat() + 1)
-
-end:
-	vm.stack[vm.sp-1] = v
-	vm.pc++
-}
-
-type _dec struct{}
-
-var dec _dec
-
-func (_dec) exec(vm *vm) {
-	v := vm.stack[vm.sp-1]
-
-	if i, ok := toInt(v); ok {
-		v = intToValue(i - 1)
-		goto end
-	}
-
-	v = valueFloat(v.ToFloat() - 1)
-
-end:
-	vm.stack[vm.sp-1] = v
-	vm.pc++
-}
-
-type _and struct{}
-
-var and _and
-
-func (_and) exec(vm *vm) {
-	left := toInt32(vm.stack[vm.sp-2])
-	right := toInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left & right))
-	vm.sp--
-	vm.pc++
-}
-
-type _or struct{}
-
-var or _or
-
-func (_or) exec(vm *vm) {
-	left := toInt32(vm.stack[vm.sp-2])
-	right := toInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left | right))
-	vm.sp--
-	vm.pc++
-}
-
-type _xor struct{}
-
-var xor _xor
-
-func (_xor) exec(vm *vm) {
-	left := toInt32(vm.stack[vm.sp-2])
-	right := toInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left ^ right))
-	vm.sp--
-	vm.pc++
-}
-
-type _bnot struct{}
-
-var bnot _bnot
-
-func (_bnot) exec(vm *vm) {
-	op := toInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-1] = intToValue(int64(^op))
-	vm.pc++
-}
-
-type _sal struct{}
-
-var sal _sal
-
-func (_sal) exec(vm *vm) {
-	left := toInt32(vm.stack[vm.sp-2])
-	right := toUInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left << (right & 0x1F)))
-	vm.sp--
-	vm.pc++
-}
-
-type _sar struct{}
-
-var sar _sar
-
-func (_sar) exec(vm *vm) {
-	left := toInt32(vm.stack[vm.sp-2])
-	right := toUInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left >> (right & 0x1F)))
-	vm.sp--
-	vm.pc++
-}
-
-type _shr struct{}
-
-var shr _shr
-
-func (_shr) exec(vm *vm) {
-	left := toUInt32(vm.stack[vm.sp-2])
-	right := toUInt32(vm.stack[vm.sp-1])
-	vm.stack[vm.sp-2] = intToValue(int64(left >> (right & 0x1F)))
-	vm.sp--
-	vm.pc++
-}
-
-type _halt struct{}
-
-var halt _halt
-
-func (_halt) exec(vm *vm) {
-	vm.halt = true
-	vm.pc++
-}
-
-type jump int32
-
-func (j jump) exec(vm *vm) {
-	vm.pc += int(j)
-}
-
-type _setElem struct{}
-
-var setElem _setElem
-
-func (_setElem) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-3])
-	propName := vm.stack[vm.sp-2]
-	val := vm.stack[vm.sp-1]
-
-	obj.self.put(propName, val, false)
-
-	vm.sp -= 2
-	vm.stack[vm.sp-1] = val
-	vm.pc++
-}
-
-type _setElemStrict struct{}
-
-var setElemStrict _setElemStrict
-
-func (_setElemStrict) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-3])
-	propName := vm.stack[vm.sp-2]
-	val := vm.stack[vm.sp-1]
-
-	obj.self.put(propName, val, true)
-
-	vm.sp -= 2
-	vm.stack[vm.sp-1] = val
-	vm.pc++
-}
-
-type _deleteElem struct{}
-
-var deleteElem _deleteElem
-
-func (_deleteElem) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-2])
-	propName := vm.stack[vm.sp-1]
-	if !obj.self.hasProperty(propName) || obj.self.delete(propName, false) {
-		vm.stack[vm.sp-2] = valueTrue
-	} else {
-		vm.stack[vm.sp-2] = valueFalse
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _deleteElemStrict struct{}
-
-var deleteElemStrict _deleteElemStrict
-
-func (_deleteElemStrict) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-2])
-	propName := vm.stack[vm.sp-1]
-	obj.self.delete(propName, true)
-	vm.stack[vm.sp-2] = valueTrue
-	vm.sp--
-	vm.pc++
-}
-
-type deleteProp string
-
-func (d deleteProp) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-1])
-	if !obj.self.hasPropertyStr(string(d)) || obj.self.deleteStr(string(d), false) {
-		vm.stack[vm.sp-1] = valueTrue
-	} else {
-		vm.stack[vm.sp-1] = valueFalse
-	}
-	vm.pc++
-}
-
-type deletePropStrict string
-
-func (d deletePropStrict) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-1])
-	obj.self.deleteStr(string(d), true)
-	vm.stack[vm.sp-1] = valueTrue
-	vm.pc++
-}
-
-type setProp string
-
-func (p setProp) exec(vm *vm) {
-	val := vm.stack[vm.sp-1]
-
-	vm.r.toObject(vm.stack[vm.sp-2]).self.putStr(string(p), val, false)
-	vm.stack[vm.sp-2] = val
-	vm.sp--
-	vm.pc++
-}
-
-type setPropStrict string
-
-func (p setPropStrict) exec(vm *vm) {
-	obj := vm.stack[vm.sp-2]
-	val := vm.stack[vm.sp-1]
-
-	obj1 := vm.r.toObject(obj)
-	obj1.self.putStr(string(p), val, true)
-	vm.stack[vm.sp-2] = val
-	vm.sp--
-	vm.pc++
-}
-
-type setProp1 string
-
-func (p setProp1) exec(vm *vm) {
-	vm.r.toObject(vm.stack[vm.sp-2]).self._putProp(string(p), vm.stack[vm.sp-1], true, true, true)
-
-	vm.sp--
-	vm.pc++
-}
-
-type _setProto struct{}
-
-var setProto _setProto
-
-func (_setProto) exec(vm *vm) {
-	vm.r.toObject(vm.stack[vm.sp-2]).self.putStr("__proto__", vm.stack[vm.sp-1], true)
-
-	vm.sp--
-	vm.pc++
-}
-
-type setPropGetter string
-
-func (s setPropGetter) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-2])
-	val := vm.stack[vm.sp-1]
-
-	descr := propertyDescr{
-		Getter:       val,
-		Configurable: FLAG_TRUE,
-		Enumerable:   FLAG_TRUE,
-	}
-
-	obj.self.defineOwnProperty(newStringValue(string(s)), descr, false)
-
-	vm.sp--
-	vm.pc++
-}
-
-type setPropSetter string
-
-func (s setPropSetter) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-2])
-	val := vm.stack[vm.sp-1]
-
-	descr := propertyDescr{
-		Setter:       val,
-		Configurable: FLAG_TRUE,
-		Enumerable:   FLAG_TRUE,
-	}
-
-	obj.self.defineOwnProperty(newStringValue(string(s)), descr, false)
-
-	vm.sp--
-	vm.pc++
+func (r *Runtime) NewGoError(err error) *Object {
+	e := r.newError(r.global.GoError, err.Error()).(*Object)
+	e.Set("value", err)
+	return e
 }
 
-type getProp string
+func (r *Runtime) newFunc(name string, len int, strict bool) (f *funcObject) {
+	v := &Object{runtime: r}
 
-func (g getProp) exec(vm *vm) {
-	v := vm.stack[vm.sp-1]
-	obj := v.baseObject(vm.r)
-	if obj == nil {
-		vm.r.typeErrorResult(true, "Cannot read property '%s' of undefined", g)
+	f = &funcObject{}
+	f.class = classFunction
+	f.val = v
+	f.extensible = true
+	v.self = f
+	f.prototype = r.global.FunctionPrototype
+	f.init(name, len)
+	if strict {
+		f._put("caller", r.global.throwerProperty)
+		f._put("arguments", r.global.throwerProperty)
 	}
-	prop := obj.self.getPropStr(string(g))
-	if prop1, ok := prop.(*valueProperty); ok {
-		vm.stack[vm.sp-1] = prop1.get(v)
-	} else {
-		if prop == nil {
-			prop = _undefined
-		}
-		vm.stack[vm.sp-1] = prop
-	}
-
-	vm.pc++
-}
-
-type getPropCallee string
-
-func (g getPropCallee) exec(vm *vm) {
-	v := vm.stack[vm.sp-1]
-	obj := v.baseObject(vm.r)
-	if obj == nil {
-		vm.r.typeErrorResult(true, "Cannot read property '%s' of undefined", g)
-	}
-	prop := obj.self.getPropStr(string(g))
-	if prop1, ok := prop.(*valueProperty); ok {
-		vm.stack[vm.sp-1] = prop1.get(v)
-	} else {
-		if prop == nil {
-			prop = memberUnresolved{valueUnresolved{r: vm.r, ref: string(g)}}
-		}
-		vm.stack[vm.sp-1] = prop
-	}
-
-	vm.pc++
-}
-
-type _getElem struct{}
-
-var getElem _getElem
-
-func (_getElem) exec(vm *vm) {
-	v := vm.stack[vm.sp-2]
-	obj := v.baseObject(vm.r)
-	propName := vm.stack[vm.sp-1]
-	if obj == nil {
-		vm.r.typeErrorResult(true, "Cannot read property '%s' of undefined", propName.String())
-	}
-
-	prop := obj.self.getProp(propName)
-	if prop1, ok := prop.(*valueProperty); ok {
-		vm.stack[vm.sp-2] = prop1.get(v)
-	} else {
-		if prop == nil {
-			prop = _undefined
-		}
-		vm.stack[vm.sp-2] = prop
-	}
-
-	vm.sp--
-	vm.pc++
-}
-
-type _getElemCallee struct{}
-
-var getElemCallee _getElemCallee
-
-func (_getElemCallee) exec(vm *vm) {
-	v := vm.stack[vm.sp-2]
-	obj := v.baseObject(vm.r)
-	propName := vm.stack[vm.sp-1]
-	if obj == nil {
-		vm.r.typeErrorResult(true, "Cannot read property '%s' of undefined", propName.String())
-		panic("Unreachable")
-	}
-
-	prop := obj.self.getProp(propName)
-	if prop1, ok := prop.(*valueProperty); ok {
-		vm.stack[vm.sp-2] = prop1.get(v)
-	} else {
-		if prop == nil {
-			prop = memberUnresolved{valueUnresolved{r: vm.r, ref: propName.String()}}
-		}
-		vm.stack[vm.sp-2] = prop
-	}
-
-	vm.sp--
-	vm.pc++
-}
-
-type _dup struct{}
-
-var dup _dup
-
-func (_dup) exec(vm *vm) {
-	vm.push(vm.stack[vm.sp-1])
-	vm.pc++
-}
-
-type dupN uint32
-
-func (d dupN) exec(vm *vm) {
-	vm.push(vm.stack[vm.sp-1-int(d)])
-	vm.pc++
-}
-
-type rdupN uint32
-
-func (d rdupN) exec(vm *vm) {
-	vm.stack[vm.sp-1-int(d)] = vm.stack[vm.sp-1]
-	vm.pc++
-}
-
-type _newObject struct{}
-
-var newObject _newObject
-
-func (_newObject) exec(vm *vm) {
-	vm.push(vm.r.NewObject())
-	vm.pc++
-}
-
-type newArray uint32
-
-func (l newArray) exec(vm *vm) {
-	values := make([]Value, l)
-	if l > 0 {
-		copy(values, vm.stack[vm.sp-int(l):vm.sp])
-	}
-	obj := vm.r.newArrayValues(values)
-	if l > 0 {
-		vm.sp -= int(l) - 1
-		vm.stack[vm.sp-1] = obj
-	} else {
-		vm.push(obj)
-	}
-	vm.pc++
-}
-
-type newRegexp struct {
-	pattern regexpPattern
-	src     valueString
-
-	global, ignoreCase, multiline bool
-}
-
-func (n *newRegexp) exec(vm *vm) {
-	vm.push(vm.r.newRegExpp(n.pattern, n.src, n.global, n.ignoreCase, n.multiline, vm.r.global.RegExpPrototype))
-	vm.pc++
-}
-
-func (vm *vm) setLocal(s int) {
-	v := vm.stack[vm.sp-1]
-	level := s >> 24
-	idx := uint32(s & 0x00FFFFFF)
-	stash := vm.stash
-	for i := 0; i < level; i++ {
-		stash = stash.outer
-	}
-	stash.putByIdx(idx, v)
-	vm.pc++
-}
-
-type setLocal uint32
-
-func (s setLocal) exec(vm *vm) {
-	vm.setLocal(int(s))
-}
-
-type setLocalP uint32
-
-func (s setLocalP) exec(vm *vm) {
-	vm.setLocal(int(s))
-	vm.sp--
-}
-
-type setVar struct {
-	name string
-	idx  uint32
-}
-
-func (s setVar) exec(vm *vm) {
-	v := vm.peek()
-
-	level := int(s.idx >> 24)
-	idx := uint32(s.idx & 0x00FFFFFF)
-	stash := vm.stash
-	name := s.name
-	for i := 0; i < level; i++ {
-		if stash.put(name, v) {
-			goto end
-		}
-		stash = stash.outer
-	}
-
-	if stash != nil {
-		stash.putByIdx(idx, v)
-	} else {
-		vm.r.globalObject.self.putStr(name, v, false)
-	}
-
-end:
-	vm.pc++
-}
-
-type resolveVar1 string
-
-func (s resolveVar1) exec(vm *vm) {
-	name := string(s)
-	var ref ref
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if stash.obj != nil {
-			if stash.obj.hasPropertyStr(name) {
-				ref = &objRef{
-					base: stash.obj,
-					name: name,
-				}
-				goto end
-			}
-		} else {
-			if idx, exists := stash.names[name]; exists {
-				ref = &stashRef{
-					v: &stash.values[idx],
-				}
-				goto end
-			}
-		}
-	}
-
-	ref = &objRef{
-		base: vm.r.globalObject.self,
-		name: name,
-	}
-
-end:
-	vm.refStack = append(vm.refStack, ref)
-	vm.pc++
-}
-
-type deleteVar string
-
-func (d deleteVar) exec(vm *vm) {
-	name := string(d)
-	ret := true
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if stash.obj != nil {
-			if stash.obj.hasPropertyStr(name) {
-				ret = stash.obj.deleteStr(name, false)
-				goto end
-			}
-		} else {
-			if _, exists := stash.names[name]; exists {
-				ret = false
-				goto end
-			}
-		}
-	}
-
-	if vm.r.globalObject.self.hasPropertyStr(name) {
-		ret = vm.r.globalObject.self.deleteStr(name, false)
-	}
-
-end:
-	if ret {
-		vm.push(valueTrue)
-	} else {
-		vm.push(valueFalse)
-	}
-	vm.pc++
-}
-
-type deleteGlobal string
-
-func (d deleteGlobal) exec(vm *vm) {
-	name := string(d)
-	var ret bool
-	if vm.r.globalObject.self.hasPropertyStr(name) {
-		ret = vm.r.globalObject.self.deleteStr(name, false)
-	} else {
-		ret = true
-	}
-	if ret {
-		vm.push(valueTrue)
-	} else {
-		vm.push(valueFalse)
-	}
-	vm.pc++
-}
-
-type resolveVar1Strict string
-
-func (s resolveVar1Strict) exec(vm *vm) {
-	name := string(s)
-	var ref ref
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if stash.obj != nil {
-			if stash.obj.hasPropertyStr(name) {
-				ref = &objRef{
-					base:   stash.obj,
-					name:   name,
-					strict: true,
-				}
-				goto end
-			}
-		} else {
-			if idx, exists := stash.names[name]; exists {
-				ref = &stashRef{
-					v: &stash.values[idx],
-				}
-				goto end
-			}
-		}
-	}
-
-	if vm.r.globalObject.self.hasPropertyStr(name) {
-		ref = &objRef{
-			base:   vm.r.globalObject.self,
-			name:   name,
-			strict: true,
-		}
-		goto end
-	}
-
-	ref = &unresolvedRef{
-		runtime: vm.r,
-		name:    string(s),
-	}
-
-end:
-	vm.refStack = append(vm.refStack, ref)
-	vm.pc++
-}
-
-type setGlobal string
-
-func (s setGlobal) exec(vm *vm) {
-	v := vm.peek()
-
-	vm.r.globalObject.self.putStr(string(s), v, false)
-	vm.pc++
-}
-
-type setVarStrict struct {
-	name string
-	idx  uint32
-}
-
-func (s setVarStrict) exec(vm *vm) {
-	v := vm.peek()
-
-	level := int(s.idx >> 24)
-	idx := uint32(s.idx & 0x00FFFFFF)
-	stash := vm.stash
-	name := s.name
-	for i := 0; i < level; i++ {
-		if stash.put(name, v) {
-			goto end
-		}
-		stash = stash.outer
-	}
-
-	if stash != nil {
-		stash.putByIdx(idx, v)
-	} else {
-		o := vm.r.globalObject.self
-		if o.hasOwnPropertyStr(name) {
-			o.putStr(name, v, true)
-		} else {
-			vm.r.throwReferenceError(name)
-		}
-	}
-
-end:
-	vm.pc++
-}
-
-type setVar1Strict string
-
-func (s setVar1Strict) exec(vm *vm) {
-	v := vm.peek()
-	var o objectImpl
-
-	name := string(s)
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if stash.put(name, v) {
-			goto end
-		}
-	}
-	o = vm.r.globalObject.self
-	if o.hasOwnPropertyStr(name) {
-		o.putStr(name, v, true)
-	} else {
-		vm.r.throwReferenceError(name)
-	}
-end:
-	vm.pc++
-}
-
-type setGlobalStrict string
-
-func (s setGlobalStrict) exec(vm *vm) {
-	v := vm.peek()
-
-	name := string(s)
-	o := vm.r.globalObject.self
-	if o.hasOwnPropertyStr(name) {
-		o.putStr(name, v, true)
-	} else {
-		vm.r.throwReferenceError(name)
-	}
-	vm.pc++
-}
-
-type getLocal uint32
-
-func (g getLocal) exec(vm *vm) {
-	level := int(g >> 24)
-	idx := uint32(g & 0x00FFFFFF)
-	stash := vm.stash
-	for i := 0; i < level; i++ {
-		stash = stash.outer
-	}
-
-	vm.push(stash.getByIdx(idx))
-	vm.pc++
-}
-
-type getVar struct {
-	name string
-	idx  uint32
-	ref  bool
-}
-
-func (g getVar) exec(vm *vm) {
-	level := int(g.idx >> 24)
-	idx := uint32(g.idx & 0x00FFFFFF)
-	stash := vm.stash
-	name := g.name
-	for i := 0; i < level; i++ {
-		if v, found := stash.getByName(name, vm); found {
-			vm.push(v)
-			goto end
-		}
-		stash = stash.outer
-	}
-	if stash != nil {
-		vm.push(stash.getByIdx(idx))
-	} else {
-		v := vm.r.globalObject.self.getStr(name)
-		if v == nil {
-			if g.ref {
-				v = valueUnresolved{r: vm.r, ref: name}
-			} else {
-				vm.r.throwReferenceError(name)
-			}
-		}
-		vm.push(v)
-	}
-end:
-	vm.pc++
-}
-
-type resolveVar struct {
-	name   string
-	idx    uint32
-	strict bool
-}
-
-func (r resolveVar) exec(vm *vm) {
-	level := int(r.idx >> 24)
-	idx := uint32(r.idx & 0x00FFFFFF)
-	stash := vm.stash
-	var ref ref
-	for i := 0; i < level; i++ {
-		if stash.obj != nil {
-			if stash.obj.hasPropertyStr(r.name) {
-				ref = &objRef{
-					base:   stash.obj,
-					name:   r.name,
-					strict: r.strict,
-				}
-				goto end
-			}
-		} else {
-			if idx, exists := stash.names[r.name]; exists {
-				ref = &stashRef{
-					v: &stash.values[idx],
-				}
-				goto end
-			}
-		}
-		stash = stash.outer
-	}
-
-	if stash != nil {
-		ref = &stashRef{
-			v: &stash.values[idx],
-		}
-		goto end
-	} /*else {
-		if vm.r.globalObject.self.hasProperty(nameVal) {
-			ref = &objRef{
-				base: vm.r.globalObject.self,
-				name: r.name,
-			}
-			goto end
-		}
-	} */
-
-	ref = &unresolvedRef{
-		runtime: vm.r,
-		name:    r.name,
-	}
-
-end:
-	vm.refStack = append(vm.refStack, ref)
-	vm.pc++
-}
-
-type _getValue struct{}
-
-var getValue _getValue
-
-func (_getValue) exec(vm *vm) {
-	ref := vm.refStack[len(vm.refStack)-1]
-	if v := ref.get(); v != nil {
-		vm.push(v)
-	} else {
-		vm.r.throwReferenceError(ref.refname())
-		panic("Unreachable")
-	}
-	vm.pc++
-}
-
-type _putValue struct{}
-
-var putValue _putValue
-
-func (_putValue) exec(vm *vm) {
-	l := len(vm.refStack) - 1
-	ref := vm.refStack[l]
-	vm.refStack[l] = nil
-	vm.refStack = vm.refStack[:l]
-	ref.set(vm.stack[vm.sp-1])
-	vm.pc++
-}
-
-type getVar1 string
-
-func (n getVar1) exec(vm *vm) {
-	name := string(n)
-	var val Value
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if v, exists := stash.getByName(name, vm); exists {
-			val = v
-			break
-		}
-	}
-	if val == nil {
-		val = vm.r.globalObject.self.getStr(name)
-		if val == nil {
-			vm.r.throwReferenceError(name)
-		}
-	}
-	vm.push(val)
-	vm.pc++
-}
-
-type getVar1Callee string
-
-func (n getVar1Callee) exec(vm *vm) {
-	name := string(n)
-	var val Value
-	for stash := vm.stash; stash != nil; stash = stash.outer {
-		if v, exists := stash.getByName(name, vm); exists {
-			val = v
-			break
-		}
-	}
-	if val == nil {
-		val = vm.r.globalObject.self.getStr(name)
-		if val == nil {
-			val = valueUnresolved{r: vm.r, ref: name}
-		}
-	}
-	vm.push(val)
-	vm.pc++
-}
-
-type _pop struct{}
-
-var pop _pop
-
-func (_pop) exec(vm *vm) {
-	vm.sp--
-	vm.pc++
-}
-
-type _swap struct{}
-
-var swap _swap
-
-func (_swap) exec(vm *vm) {
-	vm.stack[vm.sp-1], vm.stack[vm.sp-2] = vm.stack[vm.sp-2], vm.stack[vm.sp-1]
-	vm.pc++
-}
-
-func (vm *vm) callEval(n int, strict bool) {
-	if vm.r.toObject(vm.stack[vm.sp-n-1]) == vm.r.global.Eval {
-		if n > 0 {
-			srcVal := vm.stack[vm.sp-n]
-			if src, ok := srcVal.assertString(); ok {
-				var this Value
-				if vm.sb != 0 {
-					this = vm.stack[vm.sb]
-				} else {
-					this = vm.r.globalObject
-				}
-				ret := vm.r.eval(src.String(), true, strict, this)
-				vm.stack[vm.sp-n-2] = ret
-			} else {
-				vm.stack[vm.sp-n-2] = srcVal
-			}
-		} else {
-			vm.stack[vm.sp-n-2] = _undefined
-		}
-
-		vm.sp -= n + 1
-		vm.pc++
-	} else {
-		call(n).exec(vm)
-	}
+	return
 }
 
-type callEval uint32
-
-func (numargs callEval) exec(vm *vm) {
-	vm.callEval(int(numargs), false)
-}
-
-type callEvalStrict uint32
-
-func (numargs callEvalStrict) exec(vm *vm) {
-	vm.callEval(int(numargs), true)
-}
-
-type _boxThis struct{}
-
-var boxThis _boxThis
-
-func (_boxThis) exec(vm *vm) {
-	v := vm.stack[vm.sb]
-	if v == _undefined || v == _null {
-		vm.stack[vm.sb] = vm.r.globalObject
-	} else {
-		vm.stack[vm.sb] = v.ToObject(vm.r)
-	}
-	vm.pc++
-}
-
-type call uint32
-
-func (numargs call) exec(vm *vm) {
-	// this
-	// callee
-	// arg0
-	// ...
-	// arg<numargs-1>
-	n := int(numargs)
-	v := vm.stack[vm.sp-n-1] // callee
-	obj := vm.r.toCallee(v)
-repeat:
-	switch f := obj.self.(type) {
-	case *funcObject:
-		vm.pc++
-		vm.pushCtx()
-		vm.args = n
-		vm.prg = f.prg
-		vm.stash = f.stash
-		vm.pc = 0
-		vm.stack[vm.sp-n-1], vm.stack[vm.sp-n-2] = vm.stack[vm.sp-n-2], vm.stack[vm.sp-n-1]
-		return
-	case *nativeFuncObject:
-		vm._nativeCall(f, n)
-	case *boundFuncObject:
-		vm._nativeCall(&f.nativeFuncObject, n)
-	case *lazyObject:
-		obj.self = f.create(obj)
-		goto repeat
-	default:
-		vm.r.typeErrorResult(true, "Not a function: %s", obj.ToString())
-	}
-}
-
-func (vm *vm) _nativeCall(f *nativeFuncObject, n int) {
-	if f.f != nil {
-		vm.pushCtx()
-		vm.prg = nil
-		vm.funcName = f.nameProp.get(nil).String()
-		ret := f.f(FunctionCall{
-			Arguments: vm.stack[vm.sp-n : vm.sp],
-			This:      vm.stack[vm.sp-n-2],
-		})
-		if ret == nil {
-			ret = _undefined
-		}
-		vm.stack[vm.sp-n-2] = ret
-		vm.popCtx()
-	} else {
-		vm.stack[vm.sp-n-2] = _undefined
-	}
-	vm.sp -= n + 1
-	vm.pc++
-}
-
-func (vm *vm) clearStack() {
-	stackTail := vm.stack[vm.sp:]
-	for i := range stackTail {
-		stackTail[i] = nil
-	}
-	vm.stack = vm.stack[:vm.sp]
-}
-
-type enterFunc uint32
-
-func (e enterFunc) exec(vm *vm) {
-	// Input stack:
-	//
-	// callee
-	// this
-	// arg0
-	// ...
-	// argN
-	// <- sp
-
-	// Output stack:
-	//
-	// this <- sb
-	// <- sp
-
-	vm.newStash()
-	offset := vm.args - int(e)
-	vm.stash.values = make([]Value, e)
-	if offset > 0 {
-		copy(vm.stash.values, vm.stack[vm.sp-vm.args:])
-		vm.stash.extraArgs = make([]Value, offset)
-		copy(vm.stash.extraArgs, vm.stack[vm.sp-offset:])
-	} else {
-		copy(vm.stash.values, vm.stack[vm.sp-vm.args:])
-		vv := vm.stash.values[vm.args:]
-		for i, _ := range vv {
-			vv[i] = _undefined
-		}
-	}
-	vm.sp -= vm.args
-	vm.sb = vm.sp - 1
-	vm.pc++
-}
-
-type _ret struct{}
-
-var ret _ret
-
-func (_ret) exec(vm *vm) {
-	// callee -3
-	// this -2
-	// retval -1
-
-	vm.stack[vm.sp-3] = vm.stack[vm.sp-1]
-	vm.sp -= 2
-	vm.popCtx()
-	if vm.pc < 0 {
-		vm.halt = true
-	}
-}
-
-type enterFuncStashless struct {
-	stackSize uint32
-	args      uint32
-}
-
-func (e enterFuncStashless) exec(vm *vm) {
-	vm.sb = vm.sp - vm.args - 1
-	var ss int
-	d := int(e.args) - vm.args
-	if d > 0 {
-		ss = int(e.stackSize) + d
-		vm.args = int(e.args)
-	} else {
-		ss = int(e.stackSize)
+func (r *Runtime) newNativeFuncObj(v *Object, call func(FunctionCall) Value, construct func(args []Value) *Object, name string, proto *Object, length int) *nativeFuncObject {
+	f := &nativeFuncObject{
+		baseFuncObject: baseFuncObject{
+			baseObject: baseObject{
+				class:      classFunction,
+				val:        v,
+				extensible: true,
+				prototype:  r.global.FunctionPrototype,
+			},
+		},
+		f:         call,
+		construct: construct,
 	}
-	sp := vm.sp
-	if ss > 0 {
-		vm.sp += int(ss)
-		vm.stack.expand(vm.sp)
-		s := vm.stack[sp:vm.sp]
-		for i, _ := range s {
-			s[i] = _undefined
-		}
+	v.self = f
+	f.init(name, length)
+	if proto != nil {
+		f._putProp("prototype", proto, false, false, false)
 	}
-	vm.pc++
-}
-
-type _retStashless struct{}
-
-var retStashless _retStashless
-
-func (_retStashless) exec(vm *vm) {
-	retval := vm.stack[vm.sp-1]
-	vm.sp = vm.sb
-	vm.stack[vm.sp-1] = retval
-	vm.popCtx()
-	if vm.pc < 0 {
-		vm.halt = true
-	}
-}
-
-type newFunc struct {
-	prg    *Program
-	name   string
-	length uint32
-	strict bool
-
-	srcStart, srcEnd uint32
-}
-
-func (n *newFunc) exec(vm *vm) {
-	obj := vm.r.newFunc(n.name, int(n.length), n.strict)
-	obj.prg = n.prg
-	obj.stash = vm.stash
-	obj.src = n.prg.src.src[n.srcStart:n.srcEnd]
-	vm.push(obj.val)
-	vm.pc++
+	return f
 }
 
-type bindName string
+func (r *Runtime) newNativeConstructor(call func(ConstructorCall) *Object, name string, length int) *Object {
+	v := &Object{runtime: r}
 
-func (d bindName) exec(vm *vm) {
-	if vm.stash != nil {
-		vm.stash.createBinding(string(d))
-	} else {
-		vm.r.globalObject.self._putProp(string(d), _undefined, true, true, false)
+	f := &nativeFuncObject{
+		baseFuncObject: baseFuncObject{
+			baseObject: baseObject{
+				class:      classFunction,
+				val:        v,
+				extensible: true,
+				prototype:  r.global.FunctionPrototype,
+			},
+		},
 	}
-	vm.pc++
-}
-
-type jne int32
 
-func (j jne) exec(vm *vm) {
-	vm.sp--
-	if !vm.stack[vm.sp].ToBoolean() {
-		vm.pc += int(j)
-	} else {
-		vm.pc++
+	f.f = func(c FunctionCall) Value {
+		return f.defaultConstruct(call, c.Arguments)
 	}
-}
-
-type jeq int32
 
-func (j jeq) exec(vm *vm) {
-	vm.sp--
-	if vm.stack[vm.sp].ToBoolean() {
-		vm.pc += int(j)
-	} else {
-		vm.pc++
+	f.construct = func(args []Value) *Object {
+		return f.defaultConstruct(call, args)
 	}
-}
-
-type jeq1 int32
 
-func (j jeq1) exec(vm *vm) {
-	if vm.stack[vm.sp-1].ToBoolean() {
-		vm.pc += int(j)
-	} else {
-		vm.pc++
-	}
-}
+	v.self = f
+	f.init(name, length)
 
-type jneq1 int32
+	proto := r.NewObject()
+	proto.self._putProp("constructor", v, true, false, true)
+	f._putProp("prototype", proto, true, false, false)
 
-func (j jneq1) exec(vm *vm) {
-	if !vm.stack[vm.sp-1].ToBoolean() {
-		vm.pc += int(j)
-	} else {
-		vm.pc++
-	}
+	return v
 }
-
-type _not struct{}
 
-var not _not
+func (r *Runtime) newNativeFunc(call func(FunctionCall) Value, construct func(args []Value) *Object, name string, proto *Object, length int) *Object {
+	v := &Object{runtime: r}
 
-func (_not) exec(vm *vm) {
-	if vm.stack[vm.sp-1].ToBoolean() {
-		vm.stack[vm.sp-1] = valueFalse
-	} else {
-		vm.stack[vm.sp-1] = valueTrue
+	f := &nativeFuncObject{
+		baseFuncObject: baseFuncObject{
+			baseObject: baseObject{
+				class:      classFunction,
+				val:        v,
+				extensible: true,
+				prototype:  r.global.FunctionPrototype,
+			},
+		},
+		f:         call,
+		construct: construct,
 	}
-	vm.pc++
-}
-
-func toPrimitiveNumber(v Value) Value {
-	if o, ok := v.(*Object); ok {
-		return o.self.toPrimitiveNumber()
+	v.self = f
+	f.init(name, length)
+	if proto != nil {
+		f._putProp("prototype", proto, false, false, false)
+		proto.self._putProp("constructor", v, true, false, true)
 	}
 	return v
 }
 
-func cmp(px, py Value) Value {
-	var ret bool
-	var nx, ny float64
-
-	if xs, ok := px.assertString(); ok {
-		if ys, ok := py.assertString(); ok {
-			ret = xs.compareTo(ys) < 0
-			goto end
-		}
+func (r *Runtime) newNativeFuncConstructObj(v *Object, construct func(args []Value, proto *Object) *Object, name string, proto *Object, length int) *nativeFuncObject {
+	f := &nativeFuncObject{
+		baseFuncObject: baseFuncObject{
+			baseObject: baseObject{
+				class:      classFunction,
+				val:        v,
+				extensible: true,
+				prototype:  r.global.FunctionPrototype,
+			},
+		},
+		f: r.constructWrap(construct, proto),
+		construct: func(args []Value) *Object {
+			return construct(args, proto)
+		},
 	}
 
-	if xi, ok := px.assertInt(); ok {
-		if yi, ok := py.assertInt(); ok {
-			ret = xi < yi
-			goto end
-		}
+	f.init(name, length)
+	if proto != nil {
+		f._putProp("prototype", proto, false, false, false)
 	}
-
-	nx = px.ToFloat()
-	ny = py.ToFloat()
-
-	if math.IsNaN(nx) || math.IsNaN(ny) {
-		return _undefined
-	}
-
-	ret = nx < ny
-
-end:
-	if ret {
-		return valueTrue
-	}
-	return valueFalse
-
+	return f
 }
 
-type _op_lt struct{}
+func (r *Runtime) newNativeFuncConstruct(construct func(args []Value, proto *Object) *Object, name string, prototype *Object, length int) *Object {
+	return r.newNativeFuncConstructProto(construct, name, prototype, r.global.FunctionPrototype, length)
+}
 
-var op_lt _op_lt
+func (r *Runtime) newNativeFuncConstructProto(construct func(args []Value, proto *Object) *Object, name string, prototype, proto *Object, length int) *Object {
+	v := &Object{runtime: r}
 
-func (_op_lt) exec(vm *vm) {
-	left := toPrimitiveNumber(vm.stack[vm.sp-2])
-	right := toPrimitiveNumber(vm.stack[vm.sp-1])
+	f := &nativeFuncObject{}
+	f.class = classFunction
+	f.val = v
+	f.extensible = true
+	v.self = f
+	f.prototype = proto
+	f.f = r.constructWrap(construct, prototype)
+	f.construct = func(args []Value) *Object {
+		return construct(args, prototype)
+	}
+	f.init(name, length)
+	if prototype != nil {
+		f._putProp("prototype", prototype, false, false, false)
+		prototype.self._putProp("constructor", v, true, false, true)
+	}
+	return v
+}
 
-	r := cmp(left, right)
-	if r == _undefined {
-		vm.stack[vm.sp-2] = valueFalse
+func (r *Runtime) newPrimitiveObject(value Value, proto *Object, class string) *Object {
+	v := &Object{runtime: r}
+
+	o := &primitiveValueObject{}
+	o.class = class
+	o.val = v
+	o.extensible = true
+	v.self = o
+	o.prototype = proto
+	o.pValue = value
+	o.init()
+	return v
+}
+
+func (r *Runtime) builtin_Number(call FunctionCall) Value {
+	if len(call.Arguments) > 0 {
+		return call.Arguments[0].ToNumber()
 	} else {
-		vm.stack[vm.sp-2] = r
+		return intToValue(0)
 	}
-	vm.sp--
-	vm.pc++
 }
 
-type _op_lte struct{}
-
-var op_lte _op_lte
-
-func (_op_lte) exec(vm *vm) {
-	left := toPrimitiveNumber(vm.stack[vm.sp-2])
-	right := toPrimitiveNumber(vm.stack[vm.sp-1])
-
-	r := cmp(right, left)
-	if r == _undefined || r == valueTrue {
-		vm.stack[vm.sp-2] = valueFalse
+func (r *Runtime) builtin_newNumber(args []Value) *Object {
+	var v Value
+	if len(args) > 0 {
+		v = args[0].ToNumber()
 	} else {
-		vm.stack[vm.sp-2] = valueTrue
+		v = intToValue(0)
 	}
-
-	vm.sp--
-	vm.pc++
+	return r.newPrimitiveObject(v, r.global.NumberPrototype, classNumber)
 }
 
-type _op_gt struct{}
-
-var op_gt _op_gt
-
-func (_op_gt) exec(vm *vm) {
-	left := toPrimitiveNumber(vm.stack[vm.sp-2])
-	right := toPrimitiveNumber(vm.stack[vm.sp-1])
-
-	r := cmp(right, left)
-	if r == _undefined {
-		vm.stack[vm.sp-2] = valueFalse
-	} else {
-		vm.stack[vm.sp-2] = r
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _op_gte struct{}
-
-var op_gte _op_gte
-
-func (_op_gte) exec(vm *vm) {
-	left := toPrimitiveNumber(vm.stack[vm.sp-2])
-	right := toPrimitiveNumber(vm.stack[vm.sp-1])
-
-	r := cmp(left, right)
-	if r == _undefined || r == valueTrue {
-		vm.stack[vm.sp-2] = valueFalse
-	} else {
-		vm.stack[vm.sp-2] = valueTrue
-	}
-
-	vm.sp--
-	vm.pc++
-}
-
-type _op_eq struct{}
-
-var op_eq _op_eq
-
-func (_op_eq) exec(vm *vm) {
-	if vm.stack[vm.sp-2].Equals(vm.stack[vm.sp-1]) {
-		vm.stack[vm.sp-2] = valueTrue
-	} else {
-		vm.stack[vm.sp-2] = valueFalse
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _op_neq struct{}
-
-var op_neq _op_neq
-
-func (_op_neq) exec(vm *vm) {
-	if vm.stack[vm.sp-2].Equals(vm.stack[vm.sp-1]) {
-		vm.stack[vm.sp-2] = valueFalse
-	} else {
-		vm.stack[vm.sp-2] = valueTrue
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _op_strict_eq struct{}
-
-var op_strict_eq _op_strict_eq
-
-func (_op_strict_eq) exec(vm *vm) {
-	if vm.stack[vm.sp-2].StrictEquals(vm.stack[vm.sp-1]) {
-		vm.stack[vm.sp-2] = valueTrue
-	} else {
-		vm.stack[vm.sp-2] = valueFalse
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _op_strict_neq struct{}
-
-var op_strict_neq _op_strict_neq
-
-func (_op_strict_neq) exec(vm *vm) {
-	if vm.stack[vm.sp-2].StrictEquals(vm.stack[vm.sp-1]) {
-		vm.stack[vm.sp-2] = valueFalse
-	} else {
-		vm.stack[vm.sp-2] = valueTrue
-	}
-	vm.sp--
-	vm.pc++
-}
-
-type _op_instanceof struct{}
-
-var op_instanceof _op_instanceof
-
-func (_op_instanceof) exec(vm *vm) {
-	left := vm.stack[vm.sp-2]
-	right := vm.r.toObject(vm.stack[vm.sp-1])
-
-	if right.self.hasInstance(left) {
-		vm.stack[vm.sp-2] = valueTrue
-	} else {
-		vm.stack[vm.sp-2] = valueFalse
-	}
-
-	vm.sp--
-	vm.pc++
-}
-
-type _op_in struct{}
-
-var op_in _op_in
-
-func (_op_in) exec(vm *vm) {
-	left := vm.stack[vm.sp-2]
-	right := vm.r.toObject(vm.stack[vm.sp-1])
-
-	if right.self.hasProperty(left) {
-		vm.stack[vm.sp-2] = valueTrue
-	} else {
-		vm.stack[vm.sp-2] = valueFalse
-	}
-
-	vm.sp--
-	vm.pc++
-}
-
-type try struct {
-	catchOffset   int32
-	finallyOffset int32
-	dynamic       bool
-}
-
-func (t try) exec(vm *vm) {
-	o := vm.pc
-	vm.pc++
-	ex := vm.runTry()
-	if ex != nil && t.catchOffset > 0 {
-		// run the catch block (in try)
-		vm.pc = o + int(t.catchOffset)
-		// TODO: if ex.val is an Error, set the stack property
-		if t.dynamic {
-			vm.newStash()
-			vm.stash.putByIdx(0, ex.val)
+func (r *Runtime) builtin_Boolean(call FunctionCall) Value {
+	if len(call.Arguments) > 0 {
+		if call.Arguments[0].ToBoolean() {
+			return valueTrue
 		} else {
-			vm.push(ex.val)
+			return valueFalse
 		}
-		ex = vm.runTry()
-		if t.dynamic {
-			vm.stash = vm.stash.outer
-		}
+	} else {
+		return valueFalse
 	}
+}
 
-	if t.finallyOffset > 0 {
-		pc := vm.pc
-		// Run finally
-		vm.pc = o + int(t.finallyOffset)
-		vm.run()
-		if vm.prg.code[vm.pc] == retFinally {
-			vm.pc = pc
+func (r *Runtime) builtin_newBoolean(args []Value) *Object {
+	var v Value
+	if len(args) > 0 {
+		if args[0].ToBoolean() {
+			v = valueTrue
 		} else {
-			// break or continue out of finally, dropping exception
-			ex = nil
+			v = valueFalse
+		}
+	} else {
+		v = valueFalse
+	}
+	return r.newPrimitiveObject(v, r.global.BooleanPrototype, classBoolean)
+}
+
+func (r *Runtime) error_toString(call FunctionCall) Value {
+	obj := call.This.ToObject(r).self
+	msg := obj.getStr("message")
+	name := obj.getStr("name")
+	var nameStr, msgStr string
+	if name != nil && name != _undefined {
+		nameStr = name.String()
+	}
+	if msg != nil && msg != _undefined {
+		msgStr = msg.String()
+	}
+	if nameStr != "" && msgStr != "" {
+		return newStringValue(fmt.Sprintf("%s: %s", name.String(), msgStr))
+	} else {
+		if nameStr != "" {
+			return name.ToString()
+		} else {
+			return msg.ToString()
 		}
 	}
+}
 
-	vm.halt = false
-
-	if ex != nil {
-		panic(ex)
+func (r *Runtime) builtin_Error(args []Value, proto *Object) *Object {
+	obj := r.newBaseObject(proto, classError)
+	if len(args) > 0 && args[0] != _undefined {
+		obj._putProp("message", args[0], true, false, true)
 	}
+	return obj.val
 }
 
-type _retFinally struct{}
-
-var retFinally _retFinally
-
-func (_retFinally) exec(vm *vm) {
-	vm.pc++
-}
-
-type enterCatch string
-
-func (varName enterCatch) exec(vm *vm) {
-	vm.stash.names = map[string]uint32{
-		string(varName): 0,
-	}
-	vm.pc++
-}
-
-type _throw struct{}
-
-var throw _throw
-
-func (_throw) exec(vm *vm) {
-	panic(vm.stack[vm.sp-1])
-}
-
-type _new uint32
-
-func (n _new) exec(vm *vm) {
-	obj := vm.r.toObject(vm.stack[vm.sp-1-int(n)])
+func (r *Runtime) builtin_new(construct *Object, args []Value) *Object {
 repeat:
-	switch f := obj.self.(type) {
-	case *funcObject:
-		args := make([]Value, n)
-		copy(args, vm.stack[vm.sp-int(n):])
-		vm.sp -= int(n)
-		vm.stack[vm.sp-1] = f.construct(args)
+	switch f := construct.self.(type) {
 	case *nativeFuncObject:
-		vm._nativeNew(f, int(n))
+		if f.construct != nil {
+			return f.construct(args)
+		} else {
+			panic("Not a constructor")
+		}
 	case *boundFuncObject:
-		vm._nativeNew(&f.nativeFuncObject, int(n))
+		if f.construct != nil {
+			return f.construct(args)
+		} else {
+			panic("Not a constructor")
+		}
+	case *funcObject:
+		// TODO: implement
+		panic("Not implemented")
 	case *lazyObject:
-		obj.self = f.create(obj)
+		construct.self = f.create(construct)
 		goto repeat
 	default:
-		vm.r.typeErrorResult(true, "Not a constructor")
+		panic("Not a constructor")
 	}
-
-	vm.pc++
 }
 
-func (vm *vm) _nativeNew(f *nativeFuncObject, n int) {
-	if f.construct != nil {
-		args := make([]Value, n)
-		copy(args, vm.stack[vm.sp-n:])
-		vm.sp -= n
-		vm.stack[vm.sp-1] = f.construct(args)
+func (r *Runtime) throw(e Value) {
+	panic(e)
+}
+
+func (r *Runtime) builtin_thrower(call FunctionCall) Value {
+	r.typeErrorResult(true, "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them")
+	return nil
+}
+
+func (r *Runtime) eval(src string, direct, strict bool, this Value) Value {
+
+	p, err := r.compile("<eval>", src, strict, true)
+	if err != nil {
+		panic(err)
+	}
+
+	vm := r.vm
+
+	vm.pushCtx()
+	vm.prg = p
+	vm.pc = 0
+	if !direct {
+		vm.stash = nil
+	}
+	vm.sb = vm.sp
+	vm.push(this)
+	if strict {
+		vm.push(valueTrue)
 	} else {
-		vm.r.typeErrorResult(true, "Not a constructor")
+		vm.push(valueFalse)
+	}
+	vm.run()
+	vm.popCtx()
+	vm.halt = false
+	retval := vm.stack[vm.sp-1]
+	vm.sp -= 2
+	return retval
+}
+
+func (r *Runtime) builtin_eval(call FunctionCall) Value {
+	if len(call.Arguments) == 0 {
+		return _undefined
+	}
+	if str, ok := call.Arguments[0].assertString(); ok {
+		return r.eval(str.String(), false, false, r.globalObject)
+	}
+	return call.Arguments[0]
+}
+
+func (r *Runtime) constructWrap(construct func(args []Value, proto *Object) *Object, proto *Object) func(call FunctionCall) Value {
+	return func(call FunctionCall) Value {
+		return construct(call.Arguments, proto)
 	}
 }
 
-type _typeof struct{}
+func (r *Runtime) toCallable(v Value) func(FunctionCall) Value {
+	if call, ok := r.toObject(v).self.assertCallable(); ok {
+		return call
+	}
+	r.typeErrorResult(true, "Value is not callable: %s", v.ToString())
+	return nil
+}
 
-var typeof _typeof
+func (r *Runtime) checkObjectCoercible(v Value) {
+	switch v.(type) {
+	case valueUndefined, valueNull:
+		r.typeErrorResult(true, "Value is not object coercible")
+	}
+}
 
-func (_typeof) exec(vm *vm) {
-	var r Value
-	switch v := vm.stack[vm.sp-1].(type) {
-	case valueUndefined, valueUnresolved:
-		r = stringUndefined
-	case valueNull:
-		r = stringObjectC
-	case *Object:
-	repeat:
-		switch s := v.self.(type) {
-		case *funcObject, *nativeFuncObject, *boundFuncObject:
-			r = stringFunction
-		case *lazyObject:
-			v.self = s.create(v)
-			goto repeat
-		default:
-			r = stringObjectC
+func toUInt32(v Value) uint32 {
+	v = v.ToNumber()
+	if i, ok := v.assertInt(); ok {
+		return uint32(i)
+	}
+
+	if f, ok := v.assertFloat(); ok {
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return uint32(int64(f))
 		}
-	case valueBool:
-		r = stringBoolean
-	case valueString:
-		r = stringString
-	case valueInt, valueFloat:
-		r = stringNumber
-	default:
-		panic(fmt.Errorf("Unknown type: %T", v))
 	}
-	vm.stack[vm.sp-1] = r
-	vm.pc++
+	return 0
 }
 
-type createArgs uint32
-
-func (formalArgs createArgs) exec(vm *vm) {
-	v := &Object{runtime: vm.r}
-	args := &argumentsObject{}
-	args.extensible = true
-	args.prototype = vm.r.global.ObjectPrototype
-	args.class = "Arguments"
-	v.self = args
-	args.val = v
-	args.length = vm.args
-	args.init()
-	i := 0
-	c := int(formalArgs)
-	if vm.args < c {
-		c = vm.args
+func toUInt16(v Value) uint16 {
+	v = v.ToNumber()
+	if i, ok := v.assertInt(); ok {
+		return uint16(i)
 	}
-	for ; i < c; i++ {
-		args._put(strconv.Itoa(i), &mappedProperty{
-			valueProperty: valueProperty{
-				writable:     true,
-				configurable: true,
-				enumerable:   true,
+
+	if f, ok := v.assertFloat(); ok {
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return uint16(int64(f))
+		}
+	}
+	return 0
+}
+
+func toLength(v Value) int64 {
+	if v == nil {
+		return 0
+	}
+	i := v.ToInteger()
+	if i < 0 {
+		return 0
+	}
+	if i >= maxInt {
+		return maxInt - 1
+	}
+	return i
+}
+
+func toInt32(v Value) int32 {
+	v = v.ToNumber()
+	if i, ok := v.assertInt(); ok {
+		return int32(i)
+	}
+
+	if f, ok := v.assertFloat(); ok {
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return int32(int64(f))
+		}
+	}
+	return 0
+}
+
+func (r *Runtime) toBoolean(b bool) Value {
+	if b {
+		return valueTrue
+	} else {
+		return valueFalse
+	}
+}
+
+// New creates an instance of a Javascript runtime that can be used to run code. Multiple instances may be created and
+// used simultaneously, however it is not possible to pass JS values across runtimes.
+func New() *Runtime {
+	r := &Runtime{}
+	r.init()
+	return r
+}
+
+// Compile creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
+// method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
+// at the same time).
+func Compile(name, src string, strict bool) (*Program, error) {
+	return compile(name, src, strict, false)
+}
+
+// CompileAST creates an internal representation of the JavaScript code that can be later run using the Runtime.RunProgram()
+// method. This representation is not linked to a runtime in any way and can be run in multiple runtimes (possibly
+// at the same time).
+func CompileAST(prg *js_ast.Program, strict bool) (*Program, error) {
+	return compileAST(prg, strict, false)
+}
+
+// MustCompile is like Compile but panics if the code cannot be compiled.
+// It simplifies safe initialization of global variables holding compiled JavaScript code.
+func MustCompile(name, src string, strict bool) *Program {
+	prg, err := Compile(name, src, strict)
+	if err != nil {
+		panic(err)
+	}
+
+	return prg
+}
+
+func compile(name, src string, strict, eval bool) (p *Program, err error) {
+	prg, err1 := parser.ParseFile(nil, name, src, 0)
+	if err1 != nil {
+		switch err1 := err1.(type) {
+		case parser.ErrorList:
+			if len(err1) > 0 && err1[0].Message == "Invalid left-hand side in assignment" {
+				err = &CompilerReferenceError{
+					CompilerError: CompilerError{
+						Message: err1.Error(),
+					},
+				}
+				return
+			}
+		}
+		// FIXME offset
+		err = &CompilerSyntaxError{
+			CompilerError: CompilerError{
+				Message: err1.Error(),
 			},
-			v: &vm.stash.values[i],
-		})
+		}
+		return
 	}
 
-	for _, v := range vm.stash.extraArgs {
-		args._put(strconv.Itoa(i), v)
-		i++
+	p, err = compileAST(prg, strict, eval)
+
+	return
+}
+
+func compileAST(prg *js_ast.Program, strict, eval bool) (p *Program, err error) {
+	c := newCompiler()
+	c.scope.strict = strict
+	c.scope.eval = eval
+
+	defer func() {
+		if x := recover(); x != nil {
+			p = nil
+			switch x1 := x.(type) {
+			case *CompilerSyntaxError:
+				err = x1
+			default:
+				panic(x)
+			}
+		}
+	}()
+
+	c.compile(prg)
+	p = c.p
+	return
+}
+
+func (r *Runtime) compile(name, src string, strict, eval bool) (p *Program, err error) {
+	p, err = compile(name, src, strict, eval)
+	if err != nil {
+		switch x1 := err.(type) {
+		case *CompilerSyntaxError:
+			err = &Exception{
+				val: r.builtin_new(r.global.SyntaxError, []Value{newStringValue(x1.Error())}),
+			}
+		case *CompilerReferenceError:
+			err = &Exception{
+				val: r.newError(r.global.ReferenceError, x1.Message),
+			} // TODO proper message
+		}
+	}
+	return
+}
+
+// RunString executes the given string in the global context.
+func (r *Runtime) RunString(str string) (Value, error) {
+	return r.RunScript("", str)
+}
+
+// RunScript executes the given string in the global context.
+func (r *Runtime) RunScript(name, src string) (Value, error) {
+	p, err := Compile(name, src, false)
+
+	if err != nil {
+		return nil, err
 	}
 
-	args._putProp("callee", vm.stack[vm.sb-1], true, false, true)
-	vm.push(v)
-	vm.pc++
+	return r.RunProgram(p)
 }
 
-type createArgsStrict uint32
-
-func (formalArgs createArgsStrict) exec(vm *vm) {
-	args := vm.r.newBaseObject(vm.r.global.ObjectPrototype, "Arguments")
-	i := 0
-	c := int(formalArgs)
-	if vm.args < c {
-		c = vm.args
+// RunProgram executes a pre-compiled (see Compile()) code in the global context.
+func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
+	defer func() {
+		if x := recover(); x != nil {
+			if intr, ok := x.(*InterruptedError); ok {
+				err = intr
+			} else {
+				panic(x)
+			}
+		}
+	}()
+	recursive := false
+	if len(r.vm.callStack) > 0 {
+		recursive = true
+		r.vm.pushCtx()
 	}
-	for _, v := range vm.stash.values[:c] {
-		args._put(strconv.Itoa(i), v)
-		i++
-	}
-
-	for _, v := range vm.stash.extraArgs {
-		args._put(strconv.Itoa(i), v)
-		i++
-	}
-
-	args._putProp("length", intToValue(int64(vm.args)), true, false, true)
-	args._put("callee", vm.r.global.throwerProperty)
-	args._put("caller", vm.r.global.throwerProperty)
-	vm.push(args.val)
-	vm.pc++
-}
-
-type _enterWith struct{}
-
-var enterWith _enterWith
-
-func (_enterWith) exec(vm *vm) {
-	vm.newStash()
-	vm.stash.obj = vm.stack[vm.sp-1].ToObject(vm.r).self
-	vm.sp--
-	vm.pc++
-}
-
-type _leaveWith struct{}
-
-var leaveWith _leaveWith
-
-func (_leaveWith) exec(vm *vm) {
-	vm.stash = vm.stash.outer
-	vm.pc++
-}
-
-func emptyIter() (propIterItem, iterNextFunc) {
-	return propIterItem{}, nil
-}
-
-type _enumerate struct{}
-
-var enumerate _enumerate
-
-func (_enumerate) exec(vm *vm) {
-	v := vm.stack[vm.sp-1]
-	if v == _undefined || v == _null {
-		vm.iterStack = append(vm.iterStack, iterStackItem{f: emptyIter})
+	r.vm.prg = p
+	r.vm.pc = 0
+	ex := r.vm.runTry()
+	if ex == nil {
+		result = r.vm.pop()
 	} else {
-		vm.iterStack = append(vm.iterStack, iterStackItem{f: v.ToObject(vm.r).self.enumerate(false, true)})
+		err = ex
 	}
-	vm.sp--
-	vm.pc++
-}
-
-type enumNext int32
-
-func (jmp enumNext) exec(vm *vm) {
-	l := len(vm.iterStack) - 1
-	item, n := vm.iterStack[l].f()
-	if n != nil {
-		vm.iterStack[l].val = newStringValue(item.name)
-		vm.iterStack[l].f = n
-		vm.pc++
+	if recursive {
+		r.vm.popCtx()
+		r.vm.halt = false
+		r.vm.clearStack()
 	} else {
-		vm.pc += int(jmp)
+		r.vm.stack = nil
+	}
+	return
+}
+
+// Interrupt a running JavaScript. The corresponding Go call will return an *InterruptedError containing v.
+// Note, it only works while in JavaScript code, it does not interrupt native Go functions (which includes all built-ins).
+func (r *Runtime) Interrupt(v interface{}) {
+	r.vm.Interrupt(v)
+}
+
+/*
+ToValue converts a Go value into JavaScript value.
+
+Primitive types (ints and uints, floats, string, bool) are converted to the corresponding JavaScript primitives.
+
+func(FunctionCall) Value is treated as a native JavaScript function.
+
+map[string]interface{} is converted into a host object that largely behaves like a JavaScript Object.
+
+[]interface{} is converted into a host object that behaves largely like a JavaScript Array, however it's not extensible
+because extending it can change the pointer so it becomes detached from the original.
+
+*[]interface{} same as above, but the array becomes extensible.
+
+A function is wrapped within a native JavaScript function. When called the arguments are automatically converted to
+the appropriate Go types. If conversion is not possible, a TypeError is thrown.
+
+A slice type is converted into a generic reflect based host object that behaves similar to an unexpandable Array.
+
+Any other type is converted to a generic reflect based host object. Depending on the underlying type it behaves similar
+to a Number, String, Boolean or Object.
+
+Note that the underlying type is not lost, calling Export() returns the original Go value. This applies to all
+reflect based types.
+*/
+func (r *Runtime) ToValue(i interface{}) Value {
+	switch i := i.(type) {
+	case nil:
+		return _null
+	case Value:
+		// TODO: prevent importing Objects from a different runtime
+		return i
+	case string:
+		return newStringValue(i)
+	case bool:
+		if i {
+			return valueTrue
+		} else {
+			return valueFalse
+		}
+	case func(FunctionCall) Value:
+		return r.newNativeFunc(i, nil, "", nil, 0)
+	case func(ConstructorCall) *Object:
+		return r.newNativeConstructor(i, "", 0)
+	case int:
+		return intToValue(int64(i))
+	case int8:
+		return intToValue(int64(i))
+	case int16:
+		return intToValue(int64(i))
+	case int32:
+		return intToValue(int64(i))
+	case int64:
+		return intToValue(i)
+	case uint:
+		if int64(i) <= math.MaxInt64 {
+			return intToValue(int64(i))
+		} else {
+			return floatToValue(float64(i))
+		}
+	case uint8:
+		return intToValue(int64(i))
+	case uint16:
+		return intToValue(int64(i))
+	case uint32:
+		return intToValue(int64(i))
+	case uint64:
+		if i <= math.MaxInt64 {
+			return intToValue(int64(i))
+		}
+		return floatToValue(float64(i))
+	case float32:
+		return floatToValue(float64(i))
+	case float64:
+		return floatToValue(i)
+	case map[string]interface{}:
+		obj := &Object{runtime: r}
+		m := &objectGoMapSimple{
+			baseObject: baseObject{
+				val:        obj,
+				extensible: true,
+			},
+			data: i,
+		}
+		obj.self = m
+		m.init()
+		return obj
+	case []interface{}:
+		obj := &Object{runtime: r}
+		a := &objectGoSlice{
+			baseObject: baseObject{
+				val: obj,
+			},
+			data: &i,
+		}
+		obj.self = a
+		a.init()
+		return obj
+	case *[]interface{}:
+		obj := &Object{runtime: r}
+		a := &objectGoSlice{
+			baseObject: baseObject{
+				val: obj,
+			},
+			data:            i,
+			sliceExtensible: true,
+		}
+		obj.self = a
+		a.init()
+		return obj
+	}
+
+	origValue := reflect.ValueOf(i)
+	value := origValue
+	for value.Kind() == reflect.Ptr {
+		value = reflect.Indirect(value)
+	}
+
+	if !value.IsValid() {
+		return _null
+	}
+
+	switch value.Kind() {
+	case reflect.Map:
+		if value.Type().NumMethod() == 0 {
+			switch value.Type().Key().Kind() {
+			case reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+				reflect.Float64, reflect.Float32:
+
+				obj := &Object{runtime: r}
+				m := &objectGoMapReflect{
+					objectGoReflect: objectGoReflect{
+						baseObject: baseObject{
+							val:        obj,
+							extensible: true,
+						},
+						origValue: origValue,
+						value:     value,
+					},
+				}
+				m.init()
+				obj.self = m
+				return obj
+			}
+		}
+	case reflect.Slice:
+		obj := &Object{runtime: r}
+		a := &objectGoSliceReflect{
+			objectGoReflect: objectGoReflect{
+				baseObject: baseObject{
+					val: obj,
+				},
+				origValue: origValue,
+				value:     value,
+			},
+		}
+		a.init()
+		obj.self = a
+		return obj
+	case reflect.Func:
+		return r.newNativeFunc(r.wrapReflectFunc(value), nil, "", nil, value.Type().NumIn())
+	}
+
+	obj := &Object{runtime: r}
+	o := &objectGoReflect{
+		baseObject: baseObject{
+			val: obj,
+		},
+		origValue: origValue,
+		value:     value,
+	}
+	obj.self = o
+	o.init()
+	return obj
+}
+
+func (r *Runtime) wrapReflectFunc(value reflect.Value) func(FunctionCall) Value {
+	return func(call FunctionCall) Value {
+		typ := value.Type()
+		nargs := typ.NumIn()
+		var in []reflect.Value
+
+		if l := len(call.Arguments); l < nargs {
+			// fill missing arguments with zero values
+			n := nargs
+			if typ.IsVariadic() {
+				n--
+			}
+			in = make([]reflect.Value, n)
+			for i := l; i < n; i++ {
+				in[i] = reflect.Zero(typ.In(i))
+			}
+		} else {
+			if l > nargs && !typ.IsVariadic() {
+				l = nargs
+			}
+			in = make([]reflect.Value, l)
+		}
+
+		callSlice := false
+		for i, a := range call.Arguments {
+			var t reflect.Type
+
+			n := i
+			if n >= nargs-1 && typ.IsVariadic() {
+				if n > nargs-1 {
+					n = nargs - 1
+				}
+
+				t = typ.In(n).Elem()
+			} else if n > nargs-1 { // ignore extra arguments
+				break
+			} else {
+				t = typ.In(n)
+			}
+
+			// if this is a variadic Go function, and the caller has supplied
+			// exactly the number of JavaScript arguments required, and this
+			// is the last JavaScript argument, try treating the it as the
+			// actual set of variadic Go arguments. if that succeeds, break
+			// out of the loop.
+			if typ.IsVariadic() && len(call.Arguments) == nargs && i == nargs-1 {
+				if v, err := r.toReflectValue(a, typ.In(n)); err == nil {
+					in[i] = v
+					callSlice = true
+					break
+				}
+			}
+			var err error
+			in[i], err = r.toReflectValue(a, t)
+			if err != nil {
+				panic(r.newError(r.global.TypeError, "Could not convert function call parameter %v to %v", a, t))
+			}
+		}
+
+		var out []reflect.Value
+
+		if callSlice {
+			out = value.CallSlice(in)
+		} else {
+			out = value.Call(in)
+		}
+
+		if len(out) == 0 {
+			return _undefined
+		}
+
+		if last := out[len(out)-1]; last.Type().Name() == "error" {
+			if !last.IsNil() {
+				err := last.Interface()
+				if _, ok := err.(*Exception); ok {
+					panic(err)
+				}
+				panic(err.(error))
+			}
+			out = out[:len(out)-1]
+		}
+
+		switch len(out) {
+		case 0:
+			return _undefined
+		case 1:
+			return r.ToValue(out[0].Interface())
+		default:
+			s := make([]interface{}, len(out))
+			for i, v := range out {
+				s[i] = v.Interface()
+			}
+
+			return r.ToValue(s)
+		}
 	}
 }
 
-type _enumGet struct{}
+func (r *Runtime) toReflectValue(v Value, typ reflect.Type) (reflect.Value, error) {
+	switch typ.Kind() {
+	case reflect.String:
+		return reflect.ValueOf(v.String()).Convert(typ), nil
+	case reflect.Bool:
+		return reflect.ValueOf(v.ToBoolean()).Convert(typ), nil
+	case reflect.Int:
+		i, _ := toInt(v)
+		return reflect.ValueOf(int(i)).Convert(typ), nil
+	case reflect.Int64:
+		i, _ := toInt(v)
+		return reflect.ValueOf(i).Convert(typ), nil
+	case reflect.Int32:
+		i, _ := toInt(v)
+		return reflect.ValueOf(int32(i)).Convert(typ), nil
+	case reflect.Int16:
+		i, _ := toInt(v)
+		return reflect.ValueOf(int16(i)).Convert(typ), nil
+	case reflect.Int8:
+		i, _ := toInt(v)
+		return reflect.ValueOf(int8(i)).Convert(typ), nil
+	case reflect.Uint:
+		i, _ := toInt(v)
+		return reflect.ValueOf(uint(i)).Convert(typ), nil
+	case reflect.Uint64:
+		i, _ := toInt(v)
+		return reflect.ValueOf(uint64(i)).Convert(typ), nil
+	case reflect.Uint32:
+		i, _ := toInt(v)
+		return reflect.ValueOf(uint32(i)).Convert(typ), nil
+	case reflect.Uint16:
+		i, _ := toInt(v)
+		return reflect.ValueOf(uint16(i)).Convert(typ), nil
+	case reflect.Uint8:
+		i, _ := toInt(v)
+		return reflect.ValueOf(uint8(i)).Convert(typ), nil
+	}
 
-var enumGet _enumGet
+	if typ == typeCallable {
+		if fn, ok := AssertFunction(v); ok {
+			return reflect.ValueOf(fn), nil
+		}
+	}
 
-func (_enumGet) exec(vm *vm) {
-	l := len(vm.iterStack) - 1
-	vm.push(vm.iterStack[l].val)
-	vm.pc++
+	if typ.Implements(typeValue) {
+		return reflect.ValueOf(v), nil
+	}
+
+	et := v.ExportType()
+	if et == nil {
+		return reflect.Zero(typ), nil
+	}
+	if et.AssignableTo(typ) {
+		return reflect.ValueOf(v.Export()), nil
+	} else if et.ConvertibleTo(typ) {
+		return reflect.ValueOf(v.Export()).Convert(typ), nil
+	}
+
+	switch typ.Kind() {
+	case reflect.Slice:
+		if o, ok := v.(*Object); ok {
+			if o.self.className() == classArray {
+				l := int(toLength(o.self.getStr("length")))
+				s := reflect.MakeSlice(typ, l, l)
+				elemTyp := typ.Elem()
+				for i := 0; i < l; i++ {
+					item := o.self.get(intToValue(int64(i)))
+					itemval, err := r.toReflectValue(item, elemTyp)
+					if err != nil {
+						return reflect.Value{}, fmt.Errorf("Could not convert array element %v to %v at %d", v, typ, i)
+					}
+					s.Index(i).Set(itemval)
+				}
+				return s, nil
+			}
+		}
+	case reflect.Map:
+		if o, ok := v.(*Object); ok {
+			m := reflect.MakeMap(typ)
+			keyTyp := typ.Key()
+			elemTyp := typ.Elem()
+			needConvertKeys := !reflect.ValueOf("").Type().AssignableTo(keyTyp)
+			for item, f := o.self.enumerate(false, false)(); f != nil; item, f = f() {
+				var kv reflect.Value
+				var err error
+				if needConvertKeys {
+					kv, err = r.toReflectValue(newStringValue(item.name), keyTyp)
+					if err != nil {
+						return reflect.Value{}, fmt.Errorf("Could not convert map key %s to %v", item.name, typ)
+					}
+				} else {
+					kv = reflect.ValueOf(item.name)
+				}
+
+				ival := item.value
+				if ival == nil {
+					ival = o.self.getStr(item.name)
+				}
+				if ival != nil {
+					vv, err := r.toReflectValue(ival, elemTyp)
+					if err != nil {
+						return reflect.Value{}, fmt.Errorf("Could not convert map value %v to %v at key %s", ival, typ, item.name)
+					}
+					m.SetMapIndex(kv, vv)
+				} else {
+					m.SetMapIndex(kv, reflect.Zero(elemTyp))
+				}
+			}
+			return m, nil
+		}
+	case reflect.Struct:
+		if o, ok := v.(*Object); ok {
+			s := reflect.New(typ).Elem()
+			for i := 0; i < typ.NumField(); i++ {
+				field := typ.Field(i)
+				if ast.IsExported(field.Name) {
+					name := field.Name
+					if r.fieldNameMapper != nil {
+						name = r.fieldNameMapper.FieldName(typ, field)
+					}
+					v := o.self.getStr(name)
+					if v != nil {
+						vv, err := r.toReflectValue(v, field.Type)
+						if err != nil {
+							return reflect.Value{}, fmt.Errorf("Could not convert struct value %v to %v for field %s", v, field.Type, field.Name)
+
+						}
+						s.Field(i).Set(vv)
+					}
+				}
+			}
+			return s, nil
+		}
+	case reflect.Ptr:
+		ptr := reflect.New(typ.Elem())
+		elem, err := r.toReflectValue(v, typ.Elem())
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		ptr.Elem().Set(elem)
+		return ptr, nil
+	case reflect.Func:
+		if fn, ok := AssertFunction(v); ok {
+			return reflect.MakeFunc(typ, r.wrapJSFunc(fn, typ)), nil
+		}
+	}
+
+	return reflect.Value{}, fmt.Errorf("Could not convert %v to %v", v, typ)
 }
 
-type _enumPop struct{}
+func (r *Runtime) wrapJSFunc(fn Callable, typ reflect.Type) func(args []reflect.Value) (results []reflect.Value) {
+	return func(args []reflect.Value) (results []reflect.Value) {
+		jsArgs := make([]Value, len(args))
+		for i, arg := range args {
+			jsArgs[i] = r.ToValue(arg.Interface())
+		}
 
-var enumPop _enumPop
+		results = make([]reflect.Value, typ.NumOut())
+		res, err := fn(_undefined, jsArgs...)
+		if err == nil {
+			if typ.NumOut() > 0 {
+				results[0], err = r.toReflectValue(res, typ.Out(0))
+			}
+		}
 
-func (_enumPop) exec(vm *vm) {
-	l := len(vm.iterStack) - 1
-	vm.iterStack[l] = iterStackItem{}
-	vm.iterStack = vm.iterStack[:l]
-	vm.pc++
+		if err != nil {
+			if typ.NumOut() == 2 && typ.Out(1).Name() == "error" {
+				results[1] = reflect.ValueOf(err).Convert(typ.Out(1))
+			} else {
+				panic(err)
+			}
+		}
+
+		for i, v := range results {
+			if !v.IsValid() {
+				results[i] = reflect.Zero(typ.Out(i))
+			}
+		}
+
+		return
+	}
+}
+
+// ExportTo converts a JavaScript value into the specified Go value. The second parameter must be a non-nil pointer.
+// Returns error if conversion is not possible.
+func (r *Runtime) ExportTo(v Value, target interface{}) error {
+	tval := reflect.ValueOf(target)
+	if tval.Kind() != reflect.Ptr || tval.IsNil() {
+		return errors.New("target must be a non-nil pointer")
+	}
+	vv, err := r.toReflectValue(v, tval.Elem().Type())
+	if err != nil {
+		return err
+	}
+	tval.Elem().Set(vv)
+	return nil
+}
+
+// GlobalObject returns the global object.
+func (r *Runtime) GlobalObject() *Object {
+	return r.globalObject
+}
+
+// Set the specified value as a property of the global object.
+// The value is first converted using ToValue()
+func (r *Runtime) Set(name string, value interface{}) {
+	r.globalObject.self.putStr(name, r.ToValue(value), false)
+}
+
+// Get the specified property of the global object.
+func (r *Runtime) Get(name string) Value {
+	return r.globalObject.self.getStr(name)
+}
+
+// SetRandSource sets random source for this Runtime. If not called, the default math/rand is used.
+func (r *Runtime) SetRandSource(source RandSource) {
+	r.rand = source
+}
+
+// Callable represents a JavaScript function that can be called from Go.
+type Callable func(this Value, args ...Value) (Value, error)
+
+// AssertFunction checks if the Value is a function and returns a Callable.
+func AssertFunction(v Value) (Callable, bool) {
+	if obj, ok := v.(*Object); ok {
+		if f, ok := obj.self.assertCallable(); ok {
+			return func(this Value, args ...Value) (ret Value, err error) {
+				defer func() {
+					if x := recover(); x != nil {
+						if ex, ok := x.(*InterruptedError); ok {
+							err = ex
+						} else {
+							panic(x)
+						}
+					}
+				}()
+				ex := obj.runtime.vm.try(func() {
+					ret = f(FunctionCall{
+						This:      this,
+						Arguments: args,
+					})
+				})
+				if ex != nil {
+					err = ex
+				}
+				obj.runtime.vm.clearStack()
+				return
+			}, true
+		}
+	}
+	return nil, false
+}
+
+// IsUndefined returns true if the supplied Value is undefined. Note, it checks against the real undefined, not
+// against the global object's 'undefined' property.
+func IsUndefined(v Value) bool {
+	return v == _undefined
+}
+
+// IsNull returns true if the supplied Value is null.
+func IsNull(v Value) bool {
+	return v == _null
+}
+
+// Undefined returns JS undefined value. Note if global 'undefined' property is changed this still returns the original value.
+func Undefined() Value {
+	return _undefined
+}
+
+// Null returns JS null value.
+func Null() Value {
+	return _null
+}
+
+func tryFunc(f func()) (err error) {
+	defer func() {
+		if x := recover(); x != nil {
+			switch x := x.(type) {
+			case *Exception:
+				err = x
+			case *InterruptedError:
+				err = x
+			case Value:
+				err = &Exception{
+					val: x,
+				}
+			default:
+				panic(x)
+			}
+		}
+	}()
+
+	f()
+
+	return nil
 }
