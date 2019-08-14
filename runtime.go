@@ -193,9 +193,16 @@ func (e *Exception) writeFullStack(b *bytes.Buffer) {
 }
 
 func (e *Exception) writeShortStack(b *bytes.Buffer) {
-	if len(e.stack) > 0 && (e.stack[0].prg != nil || e.stack[0].funcName != "") {
-		b.WriteString(" at ")
-		e.stack[0].write(b)
+	fmt.Println(e.stack)
+	for _, stack := range e.stack {
+		if stack.prg != nil || stack.funcName != "" {
+			if stack.prg != nil && stack.prg.src != nil && stack.prg.src.name == "<builtin>" {
+				continue
+			}
+			b.WriteString(" at ")
+			stack.write(b)
+			break
+		}
 	}
 }
 
@@ -1165,7 +1172,7 @@ func (r *Runtime) wrapReflectFunc(value reflect.Value) func(FunctionCall) Value 
 				if _, ok := err.(*Exception); ok {
 					panic(err)
 				}
-				panic(r.NewGoError(last.Interface().(error)))
+				panic(err.(error))
 			}
 			out = out[:len(out)-1]
 		}

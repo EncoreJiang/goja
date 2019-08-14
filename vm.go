@@ -361,10 +361,17 @@ func (vm *vm) try(f func()) (ex *Exception) {
 					val: x1,
 				}
 				x1.Set("stack", b.String())
+				ex.stack = stack
 			case Value:
 				ex = &Exception{
 					val: x1,
 				}
+				ex.stack = stack
+			case *InterruptedError:
+				x1.stack = vm.captureStack(x1.stack, 0)
+				panic(x1)
+			case *Exception:
+				ex = x1
 			case error:
 				e := vm.r.NewGoError(x1)
 				e.Set("stack", b.String())
@@ -372,11 +379,7 @@ func (vm *vm) try(f func()) (ex *Exception) {
 				ex = &Exception{
 					val: e,
 				}
-			case *InterruptedError:
-				x1.stack = vm.captureStack(x1.stack, 0)
-				panic(x1)
-			case *Exception:
-				ex = x1
+				ex.stack = stack
 			default:
 				if vm.prg != nil {
 					vm.prg.dumpCode(log.Printf)
@@ -384,7 +387,6 @@ func (vm *vm) try(f func()) (ex *Exception) {
 				//log.Print("Stack: ", string(debug.Stack()))
 				panic(fmt.Errorf("Panic at %d: %v", vm.pc, x))
 			}
-			ex.stack = stack
 		}
 	}()
 
