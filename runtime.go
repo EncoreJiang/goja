@@ -193,7 +193,6 @@ func (e *Exception) writeFullStack(b *bytes.Buffer) {
 }
 
 func (e *Exception) writeShortStack(b *bytes.Buffer) {
-	fmt.Println(e.stack)
 	for _, stack := range e.stack {
 		if stack.prg != nil || stack.funcName != "" {
 			if stack.prg != nil && stack.prg.src != nil && stack.prg.src.name == "<builtin>" {
