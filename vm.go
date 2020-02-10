@@ -308,6 +308,23 @@ func (vm *vm) Interrupt(v interface{}) {
 	vm.interruptLock.Unlock()
 }
 
+func (vm *vm) Caller(skip int) (pc int, file string, line int, funcName string, ok bool)  {
+	var frame *stackFrame
+	if skip == 0 {
+		frame = &stackFrame{prg: vm.prg, pc: vm.pc, funcName: vm.funcName}
+	} else if len(vm.callStack)>=skip && skip > 0 {
+		i := len(vm.callStack)-skip
+		frame = &stackFrame{prg: vm.callStack[i].prg, pc: vm.callStack[i].pc - 1, funcName: vm.callStack[i].funcName}
+	} else {
+		return 0, "", 0, "", false
+	}
+	
+	if (frame.prg != nil) {
+		return frame.pc, frame.prg.src.name, frame.position().Line, frame.prg.funcName, true 
+	}
+	return frame.pc, "", 0, frame.funcName, true
+}
+
 func (vm *vm) captureStack(stack []stackFrame, ctxOffset int) []stackFrame {
 	// Unroll the context stack
 	stack = append(stack, stackFrame{prg: vm.prg, pc: vm.pc, funcName: vm.funcName})
