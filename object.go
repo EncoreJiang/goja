@@ -121,6 +121,10 @@ func (o *baseObject) getPropStr(name string) Value {
 	if val := o.getOwnProp(name); val != nil {
 		return val
 	}
+
+	if val := o.getOwnProp("*"); val != nil {
+		return val
+	}
 	if o.prototype != nil {
 		return o.prototype.self.getPropStr(name)
 	}
